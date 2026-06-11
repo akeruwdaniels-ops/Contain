@@ -1,6 +1,6 @@
 """
 +=========================================================================+
-|  DERIV RANGE BOT  v11  —  Multi-Symbol  (Monte Carlo + Jump-Diffusion)  |
+|  DERIV RANGE BOT  v10  —  RDBEAR  (Monte Carlo + Jump-Diffusion)       |
 |                                                                         |
 |  All intelligence is a dual Monte Carlo containment estimator:         |
 |                                                                         |
@@ -65,12 +65,8 @@ CONFIG = {
     "app_id"    : 1089,
     "api_token" : os.environ.get("DERIV_API_TOKEN", ""),
 
-    # -- Symbols ---------------------------------------------------------------
-    # Bot watches ALL symbols simultaneously via independent workers.
-    # Only the symbol with the highest p_blend trades at any given time.
-    # One open trade at a time globally.
-    "symbols"   : ["RDBEAR", "1HZ25V", "R_10", "R_25", "R_50", "R_75", "R_100"],
-    "symbol"    : "RDBEAR",   # legacy key — kept for calibration logging compat
+    # -- Symbol ----------------------------------------------------------------
+    "symbol"    : "RDBEAR",
 
     # -- Tick collection -------------------------------------------------------
     "collect_hours" : 0.6,          # 30 min history
@@ -151,106 +147,6 @@ CONFIG = {
 }
 
 os.makedirs(CONFIG["data_dir"], exist_ok=True)
-
-
-# ===========================================================================
-# SYMBOL PROFILES
-# Per-symbol calibration search bounds and tick rate hints.
-# barrier_bounds: {dur: (lo, hi, payout_lo, payout_hi)}
-# tpm_hint: approximate ticks/minute (None = auto-detect)
-# min_ticks: warmup ticks before live evaluation starts
-# ===========================================================================
-SYMBOL_PROFILES = {
-    "RDBEAR": {
-        "tpm_hint"  : None,   # auto-detect (~200/min)
-        "min_ticks" : 300,
-        "barrier_bounds": {
-            2:(0.50,5.0,0.46,0.50), 3:(0.80,6.0,0.46,0.50),
-            4:(1.00,7.0,0.46,0.50), 5:(1.20,8.0,0.46,0.50),
-            6:(1.40,9.0,0.46,0.50), 7:(1.60,10.5,0.46,0.50),
-            8:(1.80,12.0,0.46,0.50), 9:(2.00,13.5,0.46,0.50),
-            10:(2.20,15.0,0.46,0.50), 12:(2.60,17.5,0.46,0.50),
-            15:(3.00,21.0,0.46,0.50),
-        },
-    },
-    "1HZ25V": {
-        "tpm_hint"  : 60,     # 1 tick/sec
-        "min_ticks" : 150,
-        "barrier_bounds": {
-            2:(0.20,3.0,0.47,0.495), 3:(0.30,4.0,0.46,0.50),
-            4:(0.40,5.0,0.46,0.50), 5:(0.50,6.0,0.46,0.50),
-            6:(0.60,7.0,0.46,0.50), 7:(0.70,8.5,0.46,0.50),
-            8:(0.80,10.0,0.46,0.50), 9:(0.90,11.5,0.46,0.50),
-            10:(1.00,13.0,0.46,0.50), 12:(1.20,15.0,0.46,0.50),
-            15:(1.50,18.0,0.46,0.50),
-        },
-    },
-    "R_10": {
-        "tpm_hint"  : None,
-        "min_ticks" : 300,
-        "barrier_bounds": {
-            2:(0.03,0.40,0.46,0.50), 3:(0.05,0.55,0.46,0.50),
-            4:(0.06,0.70,0.46,0.50), 5:(0.08,0.85,0.46,0.50),
-            6:(0.09,1.00,0.46,0.50), 7:(0.10,1.15,0.46,0.50),
-            8:(0.12,1.30,0.46,0.50), 9:(0.13,1.45,0.46,0.50),
-            10:(0.15,1.60,0.46,0.50), 12:(0.17,1.90,0.46,0.50),
-            15:(0.20,2.30,0.46,0.50),
-        },
-    },
-    "R_25": {
-        "tpm_hint"  : None,
-        "min_ticks" : 300,
-        "barrier_bounds": {
-            2:(0.08,1.0,0.46,0.50), 3:(0.12,1.4,0.46,0.50),
-            4:(0.15,1.8,0.46,0.50), 5:(0.18,2.2,0.46,0.50),
-            6:(0.22,2.6,0.46,0.50), 7:(0.25,3.0,0.46,0.50),
-            8:(0.28,3.4,0.46,0.50), 9:(0.32,3.8,0.46,0.50),
-            10:(0.35,4.2,0.46,0.50), 12:(0.42,5.0,0.46,0.50),
-            15:(0.50,6.0,0.46,0.50),
-        },
-    },
-    "R_50": {
-        "tpm_hint"  : None,
-        "min_ticks" : 300,
-        "barrier_bounds": {
-            2:(0.15,2.0,0.46,0.50), 3:(0.22,2.8,0.46,0.50),
-            4:(0.28,3.5,0.46,0.50), 5:(0.35,4.3,0.46,0.50),
-            6:(0.42,5.0,0.46,0.50), 7:(0.48,5.8,0.46,0.50),
-            8:(0.55,6.6,0.46,0.50), 9:(0.62,7.4,0.46,0.50),
-            10:(0.68,8.0,0.46,0.50), 12:(0.80,9.5,0.46,0.50),
-            15:(1.00,11.5,0.46,0.50),
-        },
-    },
-    "R_75": {
-        "tpm_hint"  : None,
-        "min_ticks" : 300,
-        "barrier_bounds": {
-            2:(0.25,3.0,0.46,0.50), 3:(0.35,4.2,0.46,0.50),
-            4:(0.45,5.5,0.46,0.50), 5:(0.55,6.5,0.46,0.50),
-            6:(0.65,7.8,0.46,0.50), 7:(0.75,9.0,0.46,0.50),
-            8:(0.85,10.2,0.46,0.50), 9:(0.95,11.5,0.46,0.50),
-            10:(1.05,12.5,0.46,0.50), 12:(1.25,15.0,0.46,0.50),
-            15:(1.50,18.0,0.46,0.50),
-        },
-    },
-    "R_100": {
-        "tpm_hint"  : None,
-        "min_ticks" : 300,
-        "barrier_bounds": {
-            2:(0.35,4.5,0.46,0.50), 3:(0.50,6.0,0.46,0.50),
-            4:(0.65,8.0,0.46,0.50), 5:(0.80,9.5,0.46,0.50),
-            6:(0.95,11.0,0.46,0.50), 7:(1.10,13.0,0.46,0.50),
-            8:(1.25,14.5,0.46,0.50), 9:(1.40,16.5,0.46,0.50),
-            10:(1.55,18.0,0.46,0.50), 12:(1.80,21.0,0.46,0.50),
-            15:(2.20,25.0,0.46,0.50),
-        },
-    },
-}
-# Fallback profile for any symbol not listed
-_DEFAULT_PROFILE = SYMBOL_PROFILES["RDBEAR"]
-def get_profile(symbol: str) -> dict:
-    return SYMBOL_PROFILES.get(symbol, _DEFAULT_PROFILE)
-
 
 
 # ===========================================================================
@@ -1139,7 +1035,7 @@ class LiveTrader:
                  self.balance)
         self._conn.state = ConnState.AUTHENTICATED
         self._conn.safe_send({"balance": 1, "subscribe": 1})
-        self._conn.safe_send({"ticks": self.cfg.get("symbol", "RDBEAR"), "subscribe": 1})
+        self._conn.safe_send({"ticks": self.cfg["symbol"], "subscribe": 1})
         self._conn.state = ConnState.SUBSCRIBED
         threading.Thread(target=self._calibrate_barriers,
                          daemon=True, name="BarrierCal").start()
@@ -1302,7 +1198,7 @@ class LiveTrader:
             "currency"      : cfg.get("currency", "USD"),
             "duration"      : best_dur,
             "duration_unit" : "m",
-            "symbol"        : cfg.get("symbol", "RDBEAR"),
+            "symbol"        : cfg["symbol"],
             "barrier"       : f"+{barrier_offset:.2f}",
             "barrier2"      : f"-{barrier_offset:.2f}",
         })
@@ -1492,7 +1388,7 @@ class LiveTrader:
         cfg      = self.cfg
         durations = cfg.get("hold_durations", [2, 3, 4, 5, 6])
         fallback = cfg.get("expiryrange_barrier", 2.97)
-        symbol   = cfg.get("symbol", "RDBEAR")
+        symbol   = cfg["symbol"]
 
         log.info("[BarrierCal] Calibrating %s for durations %s ...",
                  symbol, durations)
@@ -1604,578 +1500,26 @@ class LiveTrader:
         self._calibrating = False
 
 
-
-# ===========================================================================
-# SYMBOL WORKER
-# Wraps a LiveTrader for a single symbol. Evaluates MC every tick and
-# reports the best (p_blend, duration, sigma) to the arbiter for selection.
-# ===========================================================================
-
-class SymbolWorker:
-    """
-    One SymbolWorker per symbol. Maintains:
-      - its own tick buffer (seeded with historical ticks)
-      - its own MonteCarloPricer and barrier calibration table
-      - reports candidate signals to the SymbolArbiter
-
-    The worker does NOT fire trades itself. It calls arbiter.try_trade(...)
-    which grants entry only to the best-p symbol when no trade is live.
-    """
-
-    def __init__(self, symbol: str, cfg: dict, arbiter, staker, sprt, tlog):
-        self.symbol   = symbol
-        self.cfg      = cfg
-        self.arbiter  = arbiter
-        self.profile  = get_profile(symbol)
-        self.pricer   = MonteCarloPricer(cfg)
-        self.staker   = staker
-        self.sprt     = sprt
-        self.logger   = tlog
-
-        # Override tpm if profile specifies it
-        if self.profile.get("tpm_hint"):
-            self.pricer._tpm_cfg = float(self.profile["tpm_hint"])
-
-        # Tick buffer
-        self.tick_buf  = deque(maxlen=5000)
-
-        # Barrier / payout tables
-        self.barrier_table : dict = {}
-        self.payout_table  : dict = {}
-
-        # Signal persistence
-        self._persist_count = 0
-        self._persist_best_p = 0.0
-        self._persist_dur   = None
-
-        # Live state
-        self.live_tick_count = 0
-        self.post_trade_tick = 0
-        self._calibrating    = False
-        self._last_p         = 0.0
-        self._last_ev        = 0.0
-        self._last_dur       = None
-        self._last_sigma     = 0.0
-
-        # Connection
-        self._conn   : DerivWSManager | None = None
-        self._running = False
-
-    # ── Startup ────────────────────────────────────────────────────────────
-
-    def seed(self, ticks: list):
-        """Seed tick buffer from historical data."""
-        self.tick_buf.extend(ticks)
-        log.info("[%s] Seeded with %d historical ticks.", self.symbol, len(ticks))
-
-    def start(self):
-        self._running = True
-        self._conn = DerivWSManager(
-            app_id           = self.cfg["app_id"],
-            on_open_cb       = self._on_open,
-            on_message_cb    = self._on_message,
-            on_disconnect_cb = self._on_disconnect,
-            name             = self.symbol,
-        )
-        # DerivWSManager.start() blocks — run in its own daemon thread
-        threading.Thread(
-            target=self._conn.start,
-            daemon=True,
-            name=f"WSLoop-{self.symbol}"
-        ).start()
-
-    def stop(self):
-        self._running = False
-        if self._conn:
-            self._conn.stop()
-
-    # ── WebSocket callbacks ────────────────────────────────────────────────
-
-    def _on_open(self, ws):
-        self._conn.safe_send({"authorize": self.cfg["api_token"]})
-
-    def _on_disconnect(self):
-        pass   # DerivWSManager handles reconnect automatically
-
-    def _on_message(self, ws, raw):
-        msg = json.loads(raw)
-        mt  = msg.get("msg_type", "")
-
-        if mt == "ping":
-            return
-        elif mt == "authorize":
-            log.info("[%s] Authorised. Starting tick stream + calibration.", self.symbol)
-            self._conn.safe_send({
-                "ticks": self.symbol,
-                "subscribe": 1,
-            })
-            threading.Thread(
-                target=self._calibrate_barriers,
-                args=(ws,),
-                daemon=True,
-                name=f"BarCal-{self.symbol}"
-            ).start()
-        elif mt == "tick":
-            self._on_tick(msg)
-
-    # ── Tick processing ────────────────────────────────────────────────────
-
-    def _on_tick(self, msg):
-        t = msg.get("tick", {})
-        self.tick_buf.append({
-            "timestamp": float(t.get("epoch", time.time())),
-            "price"    : float(t.get("quote", 0)),
-        })
-        self.live_tick_count += 1
-
-        # Block evaluation while trade is live or calibrating
-        if self.arbiter.trade_live or self._calibrating:
-            return
-
-        min_ticks = self.profile.get("min_ticks", self.cfg.get("min_ticks", 300))
-        if len(self.tick_buf) < min_ticks:
-            return
-
-        # Post-trade cooldown (per-symbol)
-        min_gap = self.cfg.get("min_ticks_between_trades", 60)
-        if self.live_tick_count - self.post_trade_tick < min_gap:
-            return
-
-        self._evaluate()
-
-    def _evaluate(self):
-        cfg      = self.cfg
-        ev_floor = cfg.get("ev_confidence_floor", 0.673)
-        ev_thr   = cfg.get("min_ev_threshold",    0.001)
-        durations = cfg.get("hold_durations",      [2,3,4,5,6])
-        fallback  = cfg.get("expiryrange_barrier", 2.97)
-        required  = cfg.get("signal_persistence_ticks", 2)
-
-        if not self.barrier_table:
-            return  # calibration hasn't completed yet
-
-        shared_sigma = self.pricer.ewma_sigma(self.tick_buf)
-        tpm = self.pricer._tpm_cfg or MonteCarloPricer.detect_tpm(self.tick_buf)
-
-        best_p = 0.0; best_dur = None; best_sigma = 0.0; best_T = 0
-        for dur in durations:
-            if LiveTrader._dur_crosses_midnight(dur):
-                continue
-            barrier = self.barrier_table.get(dur, fallback)
-            p, sigma, T = self.pricer.simulate_with_sigma(
-                self.tick_buf, barrier, dur, shared_sigma, tpm)
-            if p > best_p:
-                best_p = p; best_dur = dur
-                best_sigma = sigma; best_T = T
-
-        self._last_sigma = best_sigma
-        cached_payout = self.payout_table.get(best_dur, cfg.get("min_payout_pct", 0.48))
-        ev = MonteCarloPricer.ev(best_p, cached_payout)
-        self._last_p = best_p; self._last_ev = ev; self._last_dur = best_dur
-
-        if best_p < ev_floor or ev < ev_thr:
-            self._persist_count = max(0, self._persist_count - 1)
-            return
-
-        # Persistence
-        if best_dur == self._persist_dur:
-            self._persist_count += 1
-            if best_p > self._persist_best_p:
-                self._persist_best_p = best_p
-        else:
-            self._persist_count  = 1
-            self._persist_best_p = best_p
-            self._persist_dur    = best_dur
-
-        if self._persist_count >= required:
-            # Submit to arbiter — only fires if we have the best p across all symbols
-            self.arbiter.try_trade(
-                worker       = self,
-                symbol       = self.symbol,
-                p_blend      = self._persist_best_p,
-                best_dur     = best_dur,
-                best_sigma   = best_sigma,
-                cached_payout= cached_payout,
-                ev           = ev,
-            )
-
-    # ── Barrier calibration ────────────────────────────────────────────────
-
-    def _calibrate_barriers(self, ws):
-        if self._calibrating:
-            return
-        self._calibrating = True
-        cfg      = self.cfg
-        symbol   = self.symbol
-        durations = cfg.get("hold_durations", [2,3,4,5,6])
-        fallback  = cfg.get("expiryrange_barrier", 2.97)
-        bounds    = self.profile.get("barrier_bounds", {})
-
-        log.info("[BarrierCal] Calibrating %s for %d durations ...",
-                 symbol, len(durations))
-
-        import queue as _queue
-
-        def _probe_once(duration, barrier):
-            q = _queue.Queue()
-            def _oo(w): 
-                w.send(json.dumps({"authorize": cfg["api_token"]}))
-            def _om(w, raw):
-                m = json.loads(raw)
-                mt = m.get("msg_type","")
-                if mt == "authorize":
-                    w.send(json.dumps({
-                        "proposal": 1, "amount": 1, "basis": "stake",
-                        "contract_type": "EXPIRYRANGE",
-                        "currency": cfg.get("currency","USD"),
-                        "duration": duration, "duration_unit": "m",
-                        "symbol": symbol,
-                        "barrier": f"+{barrier:.2f}",
-                        "barrier2": f"-{barrier:.2f}",
-                    }))
-                elif mt == "proposal":
-                    if "error" in m:
-                        q.put(None)
-                    else:
-                        ask   = float(m["proposal"].get("ask_price", 0))
-                        payout= float(m["proposal"].get("payout", ask * 1.486))
-                        q.put(round(payout / ask - 1, 4) if ask > 0 else None)
-                    ws2.close()
-            ws2 = websocket.WebSocketApp(
-                f"{self.WS_URL}?app_id={cfg['app_id']}",
-                on_open=_oo, on_message=_om,
-                on_error=lambda *_: q.put(None),
-                on_close=lambda *_: None,
-            )
-            t = threading.Thread(target=ws2.run_forever, daemon=True)
-            t.start()
-            try:
-                return q.get(timeout=15)
-            except Exception:
-                return None
-            finally:
-                try: ws2.close()
-                except: pass
-                t.join(timeout=3)
-
-        def _probe(duration, barrier, retries=3):
-            for attempt in range(retries):
-                r = _probe_once(duration, barrier)
-                if r is not None: return r
-                time.sleep(2 ** attempt)
-            return None
-
-        for dur in durations:
-            lo, hi, p_lo, p_hi = bounds.get(dur, (0.5, 8.0, 0.46, 0.50))
-            best = fallback; best_pr = None
-            for _ in range(10):
-                mid = round((lo + hi) / 2, 2)
-                pr  = _probe(dur, mid)
-                if pr is None: break
-                if best_pr is None or abs(pr - 0.485) < abs(best_pr - 0.485):
-                    best = mid; best_pr = pr
-                if p_lo <= pr <= p_hi: break
-                if pr < p_lo: hi = mid
-                else:         lo = mid
-                time.sleep(0.3)
-
-            self.barrier_table[dur] = best
-            if best_pr is not None:
-                self.payout_table[dur] = float(best_pr)
-            log.info("[BarrierCal] %s %dm → barrier=±%.2f  payout=%.1f%%",
-                     symbol, dur, best, (best_pr or 0)*100)
-
-        log.info("[BarrierCal] %s Done: %s", symbol,
-                 {f"{k}m": f"±{v:.2f}" for k,v in self.barrier_table.items()})
-        self._calibrating = False
-
-    WS_URL = "wss://ws.binaryws.com/websockets/v3"
-
-    def on_trade_complete(self):
-        """Called by arbiter after a trade settles — reset cooldown."""
-        self.post_trade_tick = self.live_tick_count
-        self._persist_count  = 0
-        # Recalibrate barriers in background after every trade
-        if self._conn and self._conn._ws:
-            threading.Thread(
-                target=self._calibrate_barriers,
-                args=(self._conn._ws,),
-                daemon=True,
-                name=f"BarCal-{self.symbol}"
-            ).start()
-
-
-# ===========================================================================
-# SYMBOL ARBITER
-# Receives candidate signals from all SymbolWorkers.
-# Picks the best p_blend, enforces one-trade-at-a-time globally,
-# and executes the trade through the LiveTrader.
-# ===========================================================================
-
-class SymbolArbiter:
-    """
-    Receives try_trade() calls from any SymbolWorker.
-    Fires the trade only if:
-      1. No trade is currently live (trade_live == False)
-      2. This symbol has the highest p_blend of all pending candidates
-         in the current evaluation window (SELECTION_WINDOW_SECS)
-
-    The arbiter uses the LiveTrader's trade execution machinery
-    (proposal → buy → result) for whichever symbol wins.
-    """
-
-    SELECTION_WINDOW_SECS = 2.0  # window to collect competing signals before picking best
-
-    def __init__(self, cfg, staker, sprt, tlog):
-        self.cfg     = cfg
-        self.staker  = staker
-        self.sprt    = sprt
-        self.tlog    = tlog
-        self._lock   = threading.Lock()
-        self.trade_live = False
-        self._balance   : float = 0.0   # updated by TradeExecutor and auth responses
-
-        # pending candidates in current window: {symbol: (p_blend, dur, sigma, payout, ev, worker)}
-        self._candidates   : dict = {}
-        self._window_timer : threading.Timer | None = None
-
-    def try_trade(self, worker, symbol, p_blend, best_dur,
-                  best_sigma, cached_payout, ev):
-        """Called by a SymbolWorker when it has a qualifying signal."""
-        with self._lock:
-            if self.trade_live:
-                return   # trade already live — ignore
-
-            # Register this symbol as a candidate
-            self._candidates[symbol] = (p_blend, best_dur, best_sigma,
-                                        cached_payout, ev, worker)
-
-            # Start/reset the selection window timer
-            if self._window_timer:
-                self._window_timer.cancel()
-            self._window_timer = threading.Timer(
-                self.SELECTION_WINDOW_SECS,
-                self._select_and_fire
-            )
-            self._window_timer.daemon = True
-            self._window_timer.start()
-
-    def _select_and_fire(self):
-        """Pick the best candidate and fire the trade."""
-        with self._lock:
-            if self.trade_live or not self._candidates:
-                self._candidates.clear()
-                return
-
-            # Pick highest p_blend
-            best_sym = max(self._candidates,
-                           key=lambda s: self._candidates[s][0])
-            p_blend, best_dur, best_sigma, cached_payout, ev, worker =                 self._candidates[best_sym]
-            self._candidates.clear()
-            self.trade_live = True
-
-        log.info("[Arbiter] Selected %s  p=%.4f  ev=%+.4f  dur=%dm  "
-                 "(from %d candidates)",
-                 best_sym, p_blend, ev, best_dur,
-                 len(self._candidates) + 1)
-
-        # Execute trade via a dedicated TradeExecutor
-        executor = TradeExecutor(
-            symbol       = best_sym,
-            p_blend      = p_blend,
-            best_dur     = best_dur,
-            best_sigma   = best_sigma,
-            cached_payout= cached_payout,
-            ev           = ev,
-            worker       = worker,
-            arbiter      = self,
-            cfg          = self.cfg,
-            staker       = self.staker,
-            sprt         = self.sprt,
-            tlog         = self.tlog,
-        )
-        threading.Thread(
-            target=executor.execute,
-            daemon=True,
-            name=f"Trade-{best_sym}"
-        ).start()
-
-    def on_trade_done(self, worker, win: bool, profit: float, new_balance: float):
-        """Called by TradeExecutor when a trade settles."""
-        self.trade_live = False
-        worker.on_trade_complete()
-        log.info("[Arbiter] Trade settled — %s  profit=%+.2f  balance=%.2f",
-                 "WIN" if win else "LOSS", profit, new_balance)
-
-
-# ===========================================================================
-# TRADE EXECUTOR
-# Handles the proposal → buy → result flow for a single selected trade.
-# Runs in its own thread. Reports result back to the SymbolArbiter.
-# ===========================================================================
-
-class TradeExecutor:
-    WS_URL = "wss://ws.binaryws.com/websockets/v3"
-
-    def __init__(self, symbol, p_blend, best_dur, best_sigma,
-                 cached_payout, ev, worker, arbiter, cfg,
-                 staker, sprt, tlog):
-        self.symbol        = symbol
-        self.p_blend       = p_blend
-        self.best_dur      = best_dur
-        self.best_sigma    = best_sigma
-        self.cached_payout = cached_payout
-        self.ev            = ev
-        self.worker        = worker
-        self.arbiter       = arbiter
-        self.cfg           = cfg
-        self.staker        = staker
-        self.sprt          = sprt
-        self.tlog          = tlog
-
-    def execute(self):
-        cfg = self.cfg
-        import queue as _queue
-
-        balance = self.arbiter._balance
-        if not balance or balance <= 0:
-            log.warning("[TradeExec/%s] No balance — aborting.", self.symbol)
-            self.arbiter.on_trade_done(self.worker, False, 0.0, 0.0)
-            return
-
-        stake   = self.staker.next_stake(self.p_blend, balance, self.cached_payout)
-        barrier = self.worker.barrier_table.get(
-            self.best_dur, cfg.get("expiryrange_barrier", 2.97))
-
-        log.info("[TradeExec/%s] Stake=%.2f  dur=%dm  barrier=±%.2f  p=%.4f",
-                 self.symbol, stake, self.best_dur, barrier, self.p_blend)
-
-        q      = _queue.Queue()
-        result = {}
-
-        def _oo(ws):
-            ws.send(json.dumps({"authorize": cfg["api_token"]}))
-
-        def _om(ws, raw):
-            m  = json.loads(raw)
-            mt = m.get("msg_type", "")
-            if mt == "authorize":
-                ws.send(json.dumps({
-                    "proposal": 1, "amount": stake, "basis": "stake",
-                    "contract_type": "EXPIRYRANGE",
-                    "currency": cfg.get("currency","USD"),
-                    "duration": self.best_dur, "duration_unit": "m",
-                    "symbol": self.symbol,
-                    "barrier" : f"+{barrier:.2f}",
-                    "barrier2": f"-{barrier:.2f}",
-                }))
-            elif mt == "proposal":
-                if "error" in m:
-                    log.warning("[TradeExec/%s] Proposal error: %s",
-                                self.symbol, m["error"].get("message","?"))
-                    q.put({"error": True})
-                    ws.close(); return
-                pid    = m["proposal"]["id"]
-                payout = float(m["proposal"].get("payout", stake * 1.486))
-                ev_real = MonteCarloPricer.ev(self.p_blend, payout / stake - 1
-                                              if stake > 0 else self.cached_payout)
-                actual_payout_ratio = (payout / stake - 1) if stake > 0 else 0
-                min_pay = cfg.get("min_payout_pct", 0.48)
-                log.info("[TradeExec/%s] Proposal OK  payout=%.1f%%  EV=%+.4f",
-                         self.symbol, actual_payout_ratio * 100, ev_real)
-                if actual_payout_ratio < min_pay:
-                    log.warning("[TradeExec/%s] Actual payout %.1f%% below min %.1f%% — aborting.",
-                                self.symbol, actual_payout_ratio * 100, min_pay * 100)
-                    q.put({"error": True, "reason": "payout_too_low"})
-                    ws.close(); return
-                ws.send(json.dumps({"buy": pid, "price": stake}))
-            elif mt == "buy":
-                if "error" in m:
-                    log.warning("[TradeExec/%s] Buy error: %s",
-                                self.symbol, m["error"].get("message","?"))
-                    q.put({"error": True})
-                    ws.close(); return
-                cid = m["buy"]["contract_id"]
-                result["stake"]  = stake
-                result["cid"]    = cid
-                result["payout"] = float(m["buy"].get("payout", stake * 1.486))
-                log.info("[TradeExec/%s] Opened  cid=%s  paid=%.2f",
-                         self.symbol, cid, stake)
-                ws.send(json.dumps({"proposal_open_contract": 1,
-                                    "contract_id": cid, "subscribe": 1}))
-            elif mt == "proposal_open_contract":
-                poc = m.get("proposal_open_contract", {})
-                if poc.get("is_sold") or poc.get("status") in ("won","lost"):
-                    win    = poc.get("profit", 0) > 0
-                    profit = float(poc.get("profit", 0))
-                    new_bal= float(poc.get("balance_after",
-                                           balance + profit))
-                    result.update({"win": win, "profit": profit,
-                                   "balance_after": new_bal})
-                    # Update shared balance in arbiter
-                    self.arbiter._balance = new_bal
-                    q.put(result)
-                    ws.close()
-
-        ex_ws = websocket.WebSocketApp(
-            f"{self.WS_URL}?app_id={cfg['app_id']}",
-            on_open=_oo, on_message=_om,
-            on_error=lambda *_: q.put({"error": True}),
-            on_close=lambda *_: None,
-        )
-        t = threading.Thread(target=ex_ws.run_forever, daemon=True)
-        t.start()
-
-        try:
-            r = q.get(timeout=max(self.best_dur * 60 + 30, 120))
-        except Exception:
-            log.warning("[TradeExec/%s] Timed out waiting for result.", self.symbol)
-            r = {"error": True}
-        finally:
-            try: ex_ws.close()
-            except: pass
-            t.join(timeout=3)
-
-        win    = r.get("win", False)
-        profit = r.get("profit", 0.0)
-        new_b  = r.get("balance_after", balance)
-
-        if not r.get("error"):
-            self.sprt.update(win)
-            self.tlog.log({
-                "timestamp"  : datetime.utcnow().isoformat(),
-                "symbol"     : self.symbol,
-                "duration"   : self.best_dur,
-                "p_blend"    : round(self.p_blend, 4),
-                "ev"         : round(self.ev, 4),
-                "stake"      : round(stake, 2),
-                "outcome"    : "WIN" if win else "LOSS",
-                "profit"     : round(profit, 2),
-                "balance_after": round(new_b, 2),
-            })
-
-        self.arbiter.on_trade_done(self.worker, win, profit, new_b)
-
 # ===========================================================================
 # MAIN
 # ===========================================================================
 
 def main():
-    cfg     = CONFIG
-    symbols = cfg.get("symbols", ["RDBEAR"])
+    cfg    = CONFIG
+    symbol = cfg["symbol"]
 
     log.info("=" * 65)
-    log.info("  DERIV RANGE BOT  v11  —  Multi-Symbol  MC + Jump-Diffusion")
-    log.info("  Symbols  : %s", ", ".join(symbols))
+    log.info("  DERIV RANGE BOT  v10  —  Monte Carlo + Jump-Diffusion")
+    log.info("  Symbol   : %s", symbol)
     log.info("  MC paths : %d   vol_window : %d ticks   α=%.2f   terminal_w=%.1f",
              cfg["mc_n_paths"], cfg["mc_vol_window"], cfg["mc_ewma_alpha"],
              cfg["mc_terminal_weight"])
     log.info("  JD       : threshold=%.1fσ  fit_window=%d  min_jumps=%d  weight=%.2f",
              cfg["jd_jump_threshold"], cfg["jd_fit_window"],
              cfg["jd_min_jumps"], cfg["jd_weight"])
-    log.info("  p_floor  : %.3f  min_ev: %.3f",
+    log.info("  p_floor  : %.3f  min_ev: %.3f  (48.6%% payout, break-even=0.673)",
              cfg["ev_confidence_floor"], cfg["min_ev_threshold"])
-    log.info("  Persist  : %d ticks  |  One trade at a time globally",
+    log.info("  Persist  : %d consecutive ticks above floor",
              cfg["signal_persistence_ticks"])
     log.info("=" * 65)
 
@@ -2183,87 +1527,55 @@ def main():
         log.error("DERIV_API_TOKEN not set. Exiting.")
         sys.exit(1)
 
-    # ── Phase 1: Collect historical ticks for all symbols ─────────────────
-    log.info("\n>> PHASE 1 — Historical tick collection (%d symbols)", len(symbols))
-    all_initial_ticks = {}
-    for sym in symbols:
-        data_path = os.path.join(cfg["data_dir"], f"ticks_{sym}.csv")
-        existing  = pd.read_csv(data_path) if os.path.isfile(data_path) else pd.DataFrame()
-        done      = threading.Event()
-        HistoricalCollector(sym, cfg, done, existing).start()
-        done.wait()
-        df = pd.read_csv(data_path) if os.path.isfile(data_path) else pd.DataFrame()
-        ticks = df.tail(5000).to_dict("records") if not df.empty else []
-        all_initial_ticks[sym] = ticks
-        log.info("[Main/%s] Loaded %d historical ticks.", sym, len(ticks))
+    # ── Phase 1: Load or fetch historical ticks ────────────────────────────
+    log.info("\n>> PHASE 1 — Historical tick collection")
+    data_path = os.path.join(cfg["data_dir"], f"ticks_{symbol}.csv")
+    existing  = pd.read_csv(data_path) if os.path.isfile(data_path) else pd.DataFrame()
 
-    # ── Phase 2: Fetch initial balance ────────────────────────────────────
-    log.info("\n>> PHASE 2 — Fetching account balance")
-    import queue as _bq
-    bq = _bq.Queue()
-    def _b_oo(ws):
-        ws.send(json.dumps({"authorize": cfg["api_token"]}))
-    def _b_om(ws, raw):
-        m = json.loads(raw)
-        if m.get("msg_type") == "authorize":
-            bal = float(m.get("authorize", {}).get("balance", 1.0))
-            bq.put(bal); ws.close()
-    bws = websocket.WebSocketApp(
-        f"wss://ws.binaryws.com/websockets/v3?app_id={cfg['app_id']}",
-        on_open=_b_oo, on_message=_b_om,
-        on_error=lambda *_: bq.put(1.0), on_close=lambda *_: None,
+    done = threading.Event()
+    HistoricalCollector(symbol, cfg, done, existing).start()
+    done.wait()
+
+    df = pd.read_csv(data_path)
+    if len(df) < cfg["min_ticks"]:
+        log.warning("[Main] Only %d ticks (need %d). "
+                    "Will trade once buffer fills live.", len(df), cfg["min_ticks"])
+
+    initial_ticks = df.tail(5000).to_dict("records")
+    log.info("[Main] Seeding tick buffer with %d historical ticks.",
+             len(initial_ticks))
+
+    # ── Phase 2: Start live trading ────────────────────────────────────────
+    log.info("\n>> PHASE 2 — Starting live trading on %s", symbol)
+
+    staker = KellyStaker(cfg)
+    sprt   = SPRTMonitor(
+        p0=cfg["sprt_p0"], p1=cfg["sprt_p1"],
+        alpha=cfg["sprt_alpha"], beta=cfg["sprt_beta"],
     )
-    threading.Thread(target=bws.run_forever, daemon=True).start()
-    try:
-        initial_balance = bq.get(timeout=10)
-    except Exception:
-        initial_balance = 1.0
-    log.info("[Main] Account balance: %.2f USD", initial_balance)
+    tlog   = TradeLogger(cfg["trade_log"])
+    trader = LiveTrader(cfg, initial_ticks, staker, sprt, tlog)
 
-    # ── Phase 3: Start multi-symbol trading ───────────────────────────────
-    log.info("\n>> PHASE 3 — Starting live trading on %d symbols", len(symbols))
-
-    staker  = KellyStaker(cfg)
-    sprt    = SPRTMonitor(p0=cfg["sprt_p0"], p1=cfg["sprt_p1"],
-                          alpha=cfg["sprt_alpha"], beta=cfg["sprt_beta"])
-    tlog    = TradeLogger(cfg["trade_log"])
-    arbiter = SymbolArbiter(cfg, staker, sprt, tlog)
-    arbiter._balance = initial_balance
-
-    workers = []
-    for sym in symbols:
-        w = SymbolWorker(sym, cfg, arbiter, staker, sprt, tlog)
-        w.seed(all_initial_ticks.get(sym, []))
-        workers.append(w)
-
+    # Graceful Ctrl+C / SIGTERM
     import signal as _sig
     def _shutdown(s, f):
-        log.info("\n[Main] Shutting down all workers ...")
-        for w in workers:
-            w.stop()
-    _sig.signal(_sig.SIGINT, _shutdown)
+        log.info("\n[Main] Shutting down ...")
+        trader.stop()
+    _sig.signal(_sig.SIGINT,  _shutdown)
     try:
         _sig.signal(_sig.SIGTERM, _shutdown)
     except (OSError, ValueError):
-        pass
+        pass  # SIGTERM not supported on all Windows setups
 
-    for w in workers:
-        w.start()
-        log.info("[Main] Started worker: %s", w.symbol)
-        time.sleep(0.5)   # stagger startups slightly
-
-    log.info("[Main] All %d workers running. Bot is live.", len(workers))
-
-    # Keep main thread alive
-    try:
-        while any(w._running for w in workers):
-            time.sleep(5)
-    except KeyboardInterrupt:
-        _shutdown(None, None)
+    trader.run()
 
     log.info("\n[Main] Session complete.")
-    log.info("  SPRT : %s", sprt.summary())
-    log.info("  Trades logged → %s", cfg["trade_log"])
+    log.info("  Trades    : %d",   trader.total)
+    log.info("  Win rate  : %.1f%%",
+             trader.wins / trader.total * 100 if trader.total else 0)
+    log.info("  P&L       : %+.2f", trader.session_pnl)
+    log.info("  SPRT      : %s",   sprt.summary())
+    log.info("  Trade log : %s",   cfg["trade_log"])
 
 
 if __name__ == "__main__":
