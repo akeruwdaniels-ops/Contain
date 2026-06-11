@@ -1139,7 +1139,7 @@ class LiveTrader:
                  self.balance)
         self._conn.state = ConnState.AUTHENTICATED
         self._conn.safe_send({"balance": 1, "subscribe": 1})
-        self._conn.safe_send({"ticks": self.cfg["symbol"], "subscribe": 1})
+        self._conn.safe_send({"ticks": self.cfg.get("symbol", "RDBEAR"), "subscribe": 1})
         self._conn.state = ConnState.SUBSCRIBED
         threading.Thread(target=self._calibrate_barriers,
                          daemon=True, name="BarrierCal").start()
@@ -1302,7 +1302,7 @@ class LiveTrader:
             "currency"      : cfg.get("currency", "USD"),
             "duration"      : best_dur,
             "duration_unit" : "m",
-            "symbol"        : cfg["symbol"],
+            "symbol"        : cfg.get("symbol", "RDBEAR"),
             "barrier"       : f"+{barrier_offset:.2f}",
             "barrier2"      : f"-{barrier_offset:.2f}",
         })
@@ -1492,7 +1492,7 @@ class LiveTrader:
         cfg      = self.cfg
         durations = cfg.get("hold_durations", [2, 3, 4, 5, 6])
         fallback = cfg.get("expiryrange_barrier", 2.97)
-        symbol   = cfg["symbol"]
+        symbol   = cfg.get("symbol", "RDBEAR")
 
         log.info("[BarrierCal] Calibrating %s for durations %s ...",
                  symbol, durations)
@@ -1700,10 +1700,10 @@ class SymbolWorker:
             return
         elif mt == "authorize":
             log.info("[%s] Authorised. Starting tick stream + calibration.", self.symbol)
-            ws.send(json.dumps({
+            self._conn.safe_send({
                 "ticks": self.symbol,
                 "subscribe": 1,
-            }))
+            })
             threading.Thread(
                 target=self._calibrate_barriers,
                 args=(ws,),
