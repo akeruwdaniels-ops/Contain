@@ -1677,7 +1677,12 @@ class SymbolWorker:
             on_disconnect_cb = self._on_disconnect,
             name             = self.symbol,
         )
-        self._conn.start()
+        # DerivWSManager.start() blocks — run in its own daemon thread
+        threading.Thread(
+            target=self._conn.start,
+            daemon=True,
+            name=f"WSLoop-{self.symbol}"
+        ).start()
 
     def stop(self):
         self._running = False
@@ -2074,8 +2079,15 @@ class TradeExecutor:
                 payout = float(m["proposal"].get("payout", stake * 1.486))
                 ev_real = MonteCarloPricer.ev(self.p_blend, payout / stake - 1
                                               if stake > 0 else self.cached_payout)
+                actual_payout_ratio = (payout / stake - 1) if stake > 0 else 0
+                min_pay = cfg.get("min_payout_pct", 0.48)
                 log.info("[TradeExec/%s] Proposal OK  payout=%.1f%%  EV=%+.4f",
-                         self.symbol, (payout/stake-1)*100 if stake else 0, ev_real)
+                         self.symbol, actual_payout_ratio * 100, ev_real)
+                if actual_payout_ratio < min_pay:
+                    log.warning("[TradeExec/%s] Actual payout %.1f%% below min %.1f%% — aborting.",
+                                self.symbol, actual_payout_ratio * 100, min_pay * 100)
+                    q.put({"error": True, "reason": "payout_too_low"})
+                    ws.close(); return
                 ws.send(json.dumps({"buy": pid, "price": stake}))
             elif mt == "buy":
                 if "error" in m:
