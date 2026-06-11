@@ -32,7 +32,7 @@
 +=========================================================================+
 """
 
-import csv, json, logging, math, os, sys, threading, time
+import csv, enum, json, logging, math, os, random, sys, threading, time
 import io
 from collections import deque
 from datetime import datetime
@@ -69,9 +69,9 @@ CONFIG = {
     "symbol"    : "RDBEAR",
 
     # -- Tick collection -------------------------------------------------------
-    "collect_hours" : 0.5,          # 30 min history
+    "collect_hours" : 0.6,          # 30 min history
     "data_dir"      : os.path.join(DATA_DIR, "tick_data"),
-    "min_ticks"     : 300,          # ~90s warmup on RDBEAR (was 500 = ~2.5min)
+    "min_ticks"     : 500,          # ~90s warmup on RDBEAR (was 500 = ~2.5min)
 
     # -- Expiry choices (minutes) ----------------------------------------------
     "hold_durations" : [2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 15],
@@ -558,6 +558,215 @@ class TradeLogger:
 
 
 # ===========================================================================
+# CONNECTION LAYER  (ConnState + DerivWSManager)
+# ===========================================================================
+
+class ConnState(enum.IntEnum):
+    """Connection lifecycle states, in ascending order of readiness."""
+    DISCONNECTED  = 0
+    CONNECTING    = 1
+    CONNECTED     = 2   # TCP + TLS up
+    AUTHENTICATED = 3   # authorize response confirmed
+    SUBSCRIBED    = 4   # tick stream flowing
+
+
+class DerivWSManager:
+    """
+    Manages a persistent, self-healing WebSocket connection to Deriv.
+
+    Improvements over the naive run_forever + sleep(3) loop
+    --------------------------------------------------------
+    1.  NEW WebSocketApp every reconnect cycle.
+        run_forever() leaves the object in a dead state; recycling it
+        causes silent send failures or hangs.
+
+    2.  Exponential back-off with +/-1s jitter.
+        First connect is immediate. Attempt n waits:
+            min(2 * 2^(n-1), 120) + uniform(-1, 1) seconds.
+        Avoids thundering-herd and Deriv 429 rate-limit after outages.
+
+    3.  Single heartbeat daemon bound per WS object.
+        The thread exits cleanly when its ws instance dies.
+        Old code spawned a new Heartbeat thread on every _on_open while
+        the previous thread was still running on a dead socket.
+
+    4.  Thread-safe safe_send().
+        Captures both ws pointer and state check atomically under _lock.
+        Never raises; callers fire-and-forget.
+
+    5.  on_disconnect_cb fires before every reconnect.
+        Lets the trader reset waiting_proposal / waiting_result so the
+        bot cannot hang indefinitely after a mid-trade connection drop.
+
+    6.  stop() is idempotent; safe from any thread.
+    """
+
+    WS_URL             = "wss://ws.binaryws.com/websockets/v3"
+    HEARTBEAT_INTERVAL = 20      # JSON pings (beats Railway ~55s idle timeout)
+    PING_INTERVAL      = 25      # websocket-client WS-frame ping
+    PING_TIMEOUT       = 15
+    RECONNECT_BASE     = 2.0     # initial back-off (seconds)
+    RECONNECT_CAP      = 120.0   # maximum back-off (seconds)
+
+    def __init__(self, app_id: int,
+                 on_open_cb,
+                 on_message_cb,
+                 on_disconnect_cb=None,
+                 name: str = "DerivWS"):
+        self.app_id            = app_id
+        self._on_open_cb       = on_open_cb
+        self._on_message_cb    = on_message_cb
+        self._on_disconnect_cb = on_disconnect_cb
+        self.name              = name
+
+        self._lock    = threading.Lock()
+        self.state    = ConnState.DISCONNECTED
+        self._running = False
+        self._ws      = None   # replaced every cycle; NEVER reused
+        self._attempt = 0      # drives back-off; reset to 0 on successful open
+
+    # ── Public ────────────────────────────────────────────────────────────
+
+    def safe_send(self, payload: dict) -> bool:
+        """
+        Thread-safe JSON send.
+        Returns True if delivered to the socket, False if not connected.
+        Never raises; callers can fire-and-forget.
+        """
+        with self._lock:
+            ws   = self._ws
+            live = (self.state >= ConnState.CONNECTED and ws is not None)
+        if not live:
+            return False
+        try:
+            ws.send(json.dumps(payload))
+            return True
+        except Exception as e:
+            log.warning("[%s] safe_send failed: %s", self.name, e)
+            return False
+
+    def start(self):
+        """Enter the reconnect loop (blocks the calling thread until stop())."""
+        self._running = True
+        self._loop()
+
+    def stop(self):
+        """Signal stop and close the active connection. Idempotent."""
+        self._running = False
+        self.state    = ConnState.DISCONNECTED
+        with self._lock:
+            ws = self._ws
+        if ws:
+            try: ws.close()
+            except Exception: pass
+
+    # ── Reconnect loop ────────────────────────────────────────────────────
+
+    def _loop(self):
+        while self._running:
+            # Back-off (skipped on very first connect)
+            if self._attempt > 0:
+                delay = min(
+                    self.RECONNECT_BASE * (2 ** (self._attempt - 1)),
+                    self.RECONNECT_CAP,
+                ) + random.uniform(-1.0, 1.0)
+                delay = max(1.0, delay)
+                log.info("[%s] Reconnect #%d in %.1fs ...",
+                         self.name, self._attempt, delay)
+                time.sleep(delay)
+
+            if not self._running:
+                break
+
+            # Fresh WebSocketApp -- NEVER reuse the previous object
+            self.state = ConnState.CONNECTING
+            ws = websocket.WebSocketApp(
+                f"{self.WS_URL}?app_id={self.app_id}",
+                on_open    = self._cb_open,
+                on_message = self._cb_message,
+                on_error   = self._cb_error,
+                on_close   = self._cb_close,
+            )
+            with self._lock:
+                self._ws = ws
+
+            try:
+                ws.run_forever(
+                    ping_interval = self.PING_INTERVAL,
+                    ping_timeout  = self.PING_TIMEOUT,
+                    sslopt        = {"check_hostname": True},
+                )
+            except Exception as e:
+                log.error("[%s] run_forever raised: %s", self.name, e)
+
+            # Connection is dead
+            self.state = ConnState.DISCONNECTED
+            with self._lock:
+                self._ws = None
+
+            if not self._running:
+                break
+
+            # Fire hook so trader can reset stuck flags before the sleep
+            if self._on_disconnect_cb:
+                try: self._on_disconnect_cb()
+                except Exception as e:
+                    log.error("[%s] on_disconnect_cb raised: %s", self.name, e)
+
+            self._attempt += 1
+
+        log.info("[%s] Connection loop exited cleanly.", self.name)
+
+    # ── WebSocketApp callbacks ────────────────────────────────────────────
+
+    def _cb_open(self, ws):
+        self._attempt = 0            # successful connect: reset back-off
+        self.state    = ConnState.CONNECTED
+        log.info("[%s] Connected (back-off reset).", self.name)
+        self._spawn_heartbeat(ws)    # heartbeat bound to THIS ws object
+        try:
+            self._on_open_cb(ws)
+        except Exception as e:
+            log.error("[%s] on_open_cb raised: %s", self.name, e, exc_info=True)
+
+    def _cb_message(self, ws, raw):
+        try:
+            self._on_message_cb(ws, raw)
+        except Exception as e:
+            log.error("[%s] on_message_cb raised: %s",
+                      self.name, e, exc_info=True)
+
+    def _cb_error(self, ws, error):
+        log.warning("[%s] WS error: %s", self.name, error)
+
+    def _cb_close(self, ws, code, msg):
+        log.info("[%s] WS closed  code=%s  msg=%s", self.name, code, msg)
+
+    # ── Heartbeat ─────────────────────────────────────────────────────────
+
+    def _spawn_heartbeat(self, ws):
+        """
+        Starts a daemon thread that sends a JSON ping every HEARTBEAT_INTERVAL.
+        The thread is bound to this specific ws object and exits cleanly when
+        that ws dies, leaving reconnect and any new heartbeat unaffected.
+        """
+        def _beat():
+            while self._running and self.state >= ConnState.CONNECTED:
+                try:
+                    ws.send(json.dumps({"ping": 1}))
+                except Exception:
+                    break   # ws is dead; _loop handles reconnect
+                time.sleep(self.HEARTBEAT_INTERVAL)
+            log.debug("[%s] Heartbeat exiting.", self.name)
+
+        threading.Thread(
+            target = _beat,
+            daemon = True,
+            name   = f"{self.name}-HB",
+        ).start()
+
+
+# ===========================================================================
 # HISTORICAL COLLECTOR
 # ===========================================================================
 
@@ -571,7 +780,8 @@ class HistoricalCollector:
         self.done      = done
         self._existing = existing_df
 
-    def _fetch_page(self, end_epoch):
+    def _fetch_page_once(self, end_epoch):
+        """Single attempt to fetch one page of historical ticks."""
         import queue as _q
         q = _q.Queue()
 
@@ -620,6 +830,20 @@ class HistoricalCollector:
             try: ws.close()
             except Exception: pass
             t.join(timeout=3)
+
+    def _fetch_page(self, end_epoch, max_retries=3):
+        """Fetch one page of tick history with exponential back-off retry."""
+        for attempt in range(max_retries):
+            result = self._fetch_page_once(end_epoch)
+            if result:
+                return result
+            if attempt < max_retries - 1:
+                delay = (2 ** attempt) + random.uniform(0.0, 1.0)
+                log.warning("[Collector/%s] Page fetch empty (attempt %d/%d)"
+                            " -- retrying in %.1fs ...",
+                            self.symbol, attempt + 1, max_retries, delay)
+                time.sleep(delay)
+        return []
 
     def _collect(self):
         cfg          = self.cfg
@@ -701,7 +925,6 @@ class LiveTrader:
         self.payout_table  = {}   # {duration_mins: payout_ratio}
 
         # State
-        self.ws             = None
         self.balance        = None
         self.start_balance  = None
         self.peak_balance   = None
@@ -739,51 +962,46 @@ class LiveTrader:
         # Barrier calibration flag
         self._calibrating     = False
 
+        # Connection manager (replaces raw WebSocketApp management)
+        self._conn = DerivWSManager(
+            app_id           = cfg["app_id"],
+            on_open_cb       = self._on_ws_open,
+            on_message_cb    = self._on_message,
+            on_disconnect_cb = self._on_disconnect,
+            name             = "LiveTrader",
+        )
+
     # ── WebSocket lifecycle ───────────────────────────────────────────────
 
     def run(self):
         self.running = True
-        log.info("[Trader] Connecting ...")
-        self.ws = websocket.WebSocketApp(
-            f"{self.WS_URL}?app_id={self.cfg['app_id']}",
-            on_open    = self._on_open,
-            on_message = self._on_message,
-            on_error   = self._on_error,
-            on_close   = self._on_close,
-        )
-        while self.running:
-            try:
-                self.ws.run_forever(ping_interval=25, ping_timeout=15)
-            except Exception as e:
-                log.error("[Trader] WS error: %s", e)
-            if self.running:
-                log.info("[Trader] Reconnecting in 3s ...")
-                time.sleep(3)
+        log.info("[Trader] Starting connection manager ...")
+        self._conn.start()   # blocks until stop() is called
 
     def stop(self):
         self.running = False
-        try: self.ws.close()
-        except Exception: pass
+        self._conn.stop()
 
-    def _on_open(self, ws):
-        log.info("[Trader] Connected. Authorising ...")
-        ws.send(json.dumps({"authorize": self.cfg["api_token"]}))
-        # Deriv-level JSON ping every 20s — keeps Railway proxy connection alive.
-        # Railway kills idle TCP connections at ~55s; protocol-level ping alone isn't enough.
-        def _heartbeat():
-            while self.running:
-                try:
-                    ws.send(json.dumps({"ping": 1}))
-                except Exception:
-                    break
-                time.sleep(20)
-        threading.Thread(target=_heartbeat, daemon=True, name="Heartbeat").start()
+    def _on_ws_open(self, ws):
+        """Called by DerivWSManager on every (re)connect."""
+        log.info("[Trader] (Re)connected -- authorising ...")
+        # Heartbeat is owned by DerivWSManager._spawn_heartbeat; none needed here.
+        self._conn.safe_send({"authorize": self.cfg["api_token"]})
 
-    def _on_error(self, ws, error):
-        log.warning("[Trader] WS error: %s", error)
-
-    def _on_close(self, ws, code, msg):
-        log.info("[Trader] WS closed (%s %s)", code, msg)
+    def _on_disconnect(self):
+        """
+        Called by DerivWSManager before every reconnect attempt.
+        Resets flags that could leave the bot permanently hung when a
+        connection drop occurs mid-trade or mid-proposal.
+        """
+        if self.waiting_proposal:
+            log.warning("[Trader] Connection lost during pending proposal"
+                        " -- resetting flag.")
+            self.waiting_proposal = False
+        if self.waiting_result:
+            log.warning("[Trader] Connection lost while awaiting contract"
+                        " settlement -- resetting flag (outcome unknown).")
+            self.waiting_result = False
 
     def _on_message(self, ws, raw):
         try:
@@ -815,8 +1033,10 @@ class LiveTrader:
                  info.get("loginid", "?"),
                  info.get("currency", "USD"),
                  self.balance)
-        self.ws.send(json.dumps({"balance": 1, "subscribe": 1}))
-        self.ws.send(json.dumps({"ticks": self.cfg["symbol"], "subscribe": 1}))
+        self._conn.state = ConnState.AUTHENTICATED
+        self._conn.safe_send({"balance": 1, "subscribe": 1})
+        self._conn.safe_send({"ticks": self.cfg["symbol"], "subscribe": 1})
+        self._conn.state = ConnState.SUBSCRIBED
         threading.Thread(target=self._calibrate_barriers,
                          daemon=True, name="BarrierCal").start()
         log.info("[Trader] Waiting for tick buffer to fill "
@@ -970,7 +1190,7 @@ class LiveTrader:
         self.waiting_proposal = True
 
         barrier_offset = self.barrier_table.get(best_dur, fallback)
-        self.ws.send(json.dumps({
+        self._conn.safe_send({
             "proposal"      : 1,
             "amount"        : stake,
             "basis"         : "stake",
@@ -981,7 +1201,7 @@ class LiveTrader:
             "symbol"        : cfg["symbol"],
             "barrier"       : f"+{barrier_offset:.2f}",
             "barrier2"      : f"-{barrier_offset:.2f}",
-        }))
+        })
 
     # ── Proposal response ─────────────────────────────────────────────────
 
@@ -1032,10 +1252,10 @@ class LiveTrader:
                  "EV=%+.4f  stake=$%.2f  pid=%s",
                  payout_ratio * 100, p, ev, self.pending_stake, pid)
 
-        self.ws.send(json.dumps({
+        self._conn.safe_send({
             "buy"  : pid,
             "price": self.pending_stake,
-        }))
+        })
 
     # ── Buy confirmation ──────────────────────────────────────────────────
 
@@ -1049,11 +1269,11 @@ class LiveTrader:
         cid = str(buy.get("contract_id", "?"))
         log.info("[Trader] Contract opened  cid=%s  paid=$%.2f",
                  cid, float(buy.get("buy_price", self.pending_stake)))
-        self.ws.send(json.dumps({
+        self._conn.safe_send({
             "proposal_open_contract": 1,
             "contract_id"           : int(cid),
             "subscribe"             : 1,
-        }))
+        })
 
     # ── Settlement ────────────────────────────────────────────────────────
 
@@ -1175,8 +1395,8 @@ class LiveTrader:
 
         import queue as _q
 
-        def _probe(duration, barrier):
-            """Single-shot proposal to get payout for this barrier+duration."""
+        def _probe_once(duration, barrier):
+            """Single attempt to probe the payout for a given duration+barrier."""
             q = _q.Queue()
 
             def _oo(ws):
@@ -1225,6 +1445,20 @@ class LiveTrader:
                 try: ws2.close()
                 except Exception: pass
                 t.join(timeout=3)
+
+        def _probe(duration, barrier, max_retries=3):
+            """Probe with exponential back-off retry. Returns payout ratio or None."""
+            for attempt in range(max_retries):
+                result = _probe_once(duration, barrier)
+                if result is not None:
+                    return result
+                if attempt < max_retries - 1:
+                    delay = 2 ** attempt
+                    log.warning("[BarrierCal] Probe failed  dur=%dm  barrier=+/-%.2f"
+                                "  (attempt %d/%d) retrying in %ds ...",
+                                duration, barrier, attempt + 1, max_retries, delay)
+                    time.sleep(delay)
+            return None
 
         # Per-duration barrier search bounds (lo, hi, payout_lo, payout_hi)
         dur_bounds = {
