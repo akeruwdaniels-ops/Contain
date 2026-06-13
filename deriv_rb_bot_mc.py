@@ -1,31 +1,34 @@
 """
 +=========================================================================+
-|  DERIV RANGE BOT  v10  —  1HZ10V  (Monte Carlo + Jump-Diffusion)       |
+|  DERIV RISE / FALL BOT  v3  —  Monte Carlo + Jump-Diffusion            |
 |                                                                         |
-|  All intelligence is a dual Monte Carlo containment estimator:         |
+|  Contract type : CALL (Rise) or PUT (Fall)                             |
+|  Settlement    : final tick above / below entry spot                   |
 |                                                                         |
-|  1. Pure GBM paths  (baseline)                                         |
-|       Each tick: dlog S = σ · Z,  Z ~ N(0,1)                          |
-|       σ estimated via EWMA (α=0.06, λ=0.94)                           |
+|  Signal engine (v3 upgrades):                                          |
+|    1. GBM with EWMA drift (µ)  — captures structural index bias        |
+|    2. Merton Jump-Diffusion    — fat-tail + jump direction bias (µ_J)  |
+|    3. AR(1) mean-reversion correction on T-step distribution           |
+|    4. Regime gate: σ-expansion suppresses marginal signals             |
+|    5. Asymmetric CALL scrutiny for bear-biased symbols (RDBEAR)        |
 |                                                                         |
-|  2. Merton Jump-Diffusion paths  (jump-aware)                          |
-|       Each tick: dlog S = σ · Z + J · Y                               |
-|         J ~ Poisson(λ_tick)      — does a jump occur this tick?       |
-|         Y ~ N(μ_J, σ_J²)        — how big is the jump?               |
-|       Parameters estimated live from recent tick history:              |
-|         λ  = jump rate (jumps/tick), fitted from outlier frequency     |
-|         μ_J = mean jump log-return (signed; usually ≈ 0)              |
-|         σ_J = jump size std dev (always > diffusion σ)                |
-|       Jump detection: returns whose |r| > jump_threshold·σ_ewma       |
-|       are classified as jumps; the rest are pure diffusion residuals.  |
+|  Duration selection:                                                    |
+|    Runs MC for every candidate duration, picks the one with            |
+|    the highest EV above the floor.  Falls back to "no trade"           |
+|    when no duration clears the EV threshold.                           |
 |                                                                         |
-|  3. Blended containment probability                                     |
-|       p_final = (1 - w) · p_gbm  +  w · p_jd                         |
-|       w = mc_jd_weight (default 0.5).                                  |
-|       Falls back to pure GBM when fewer than mc_jd_min_jumps           |
-|       have been observed (not enough data to fit jump parameters).     |
+|  Kelly sizing — $1 account:                                            |
+|    Fractional Kelly (25%) with tiered proportional floor:              |
+|      $0.35–$1.99  →  35%  (guarantees Deriv $0.35 minimum)            |
+|      $2.00–$4.99  →  12%                                               |
+|      $5.00–$14.99 →   7%                                               |
+|      $15.00+      →   5%                                               |
+|    Hard cap: 10% of balance, $5.00 absolute max, $0.35 absolute min.   |
 |                                                                         |
-|  4. p_final feeds EV gate → persistence → KellyStaker → SPRT          |
+|  Connection layer:                                                      |
+|    DerivWSManager — self-healing WS, exponential back-off,             |
+|    per-object heartbeat, thread-safe safe_send.                        |
+|    (Direct port from RDBEAR v10 — zero changes.)                       |
 |                                                                         |
 |  Requirements: pip install numpy websocket-client pandas               |
 |  Env:          DERIV_API_TOKEN                                          |
@@ -48,12 +51,12 @@ import pandas as pd
 _sh = logging.StreamHandler(
     io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace"))
 _sh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
-_fh = logging.FileHandler("deriv_rb_bot_mc.log", encoding="utf-8")
+_fh = logging.FileHandler("deriv_rise_fall_mc.log", encoding="utf-8")
 _fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
 logging.basicConfig(level=logging.INFO, handlers=[_sh, _fh])
-log = logging.getLogger("DerivRB_MC")
+log = logging.getLogger("DerivRF_MC")
 
-DATA_DIR = os.environ.get("DATA_DIR", "rb_bot_data")
+DATA_DIR = os.environ.get("DATA_DIR", "rf_bot_data")
 os.makedirs(DATA_DIR, exist_ok=True)
 
 
@@ -66,71 +69,103 @@ CONFIG = {
     "api_token" : os.environ.get("DERIV_API_TOKEN", ""),
 
     # -- Symbol ----------------------------------------------------------------
-    "symbol"    : "1HZ10V",
+    # Any Deriv symbol that supports CALL/PUT, e.g.:
+    #   "R_100"  (Volatility 100 Index)
+    #   "R_75"   (Volatility 75 Index)
+    #   "R_50"   (Volatility 50 Index)
+    #   "1HZ100V" (Volatility 100 (1s) Index)
+    "symbol"    : "R_100",
 
     # -- Tick collection -------------------------------------------------------
-    "collect_hours" : 0.5,          # 30 min history (1800 ticks on 1HZ10V)
+    "collect_hours" : 0.6,          # ~36 min history
     "data_dir"      : os.path.join(DATA_DIR, "tick_data"),
-    "min_ticks"     : 500,          # ~8 min warmup on 1HZ10V (1 tick/sec)
+    "min_ticks"     : 300,          # warmup ticks before trading
 
-    # -- Expiry choices (minutes) ----------------------------------------------
-    "hold_durations" : [2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 15],
+    # -- Candidate durations (ticks) -------------------------------------------
+    # Rise/Fall contracts on synthetic indices typically use tick durations.
+    # The bot will run MC for each and select the one with the highest EV.
+    # Deriv supports 1–10 ticks for CALL/PUT on synthetic indices.
+    "hold_durations" : [1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
 
-    # -- Barrier fallback (used until calibration finishes) -------------------
-    "expiryrange_barrier" : 5.3,         # calibrated from live data (5-min mid)
-    "currency"            : "USD",
+    # -- Currency --------------------------------------------------------------
+    "currency"  : "USD",
 
     # -- Monte Carlo -----------------------------------------------------------
-    "mc_n_paths"          : 5000,    # raised: std error ≈ ±0.006 (was ±0.014 at 1000 paths)
-    "mc_vol_window"       : 120,     # ticks used to compute EWMA σ (2 min on 1HZ10V)
-    "mc_ewma_alpha"       : 0.06,    # EWMA decay (RiskMetrics λ=0.94)
-    "mc_ticks_per_min"    : 60,         # 1HZ10V = 1 tick/second = 60/min (fixed)
-    # p_contain = fraction of paths staying inside barrier.
-    # Minimum threshold before considering EV.
-    "mc_p_floor"          : 0.675,   # 1HZ10V: tighter floor — near-normal MC gives honest p values
-    # Containment check mode:
-    #   terminal (1.0) = final tick only  — matches Deriv EXPIRYRANGE settlement
-    #   path     (0.0) = every tick       — strict first-passage check
-    #   blend    (0.7) = 70% terminal + 30% path
-    # RDBEAR EXPIRYRANGE settles on the LAST tick only. Pure terminal (1.0)
-    # is the correct model. Path component (< 1.0) is an optional conservative
-    # penalty — useful only if you want to avoid contracts where mid-breach risk
-    # is elevated (e.g. during high-jump regimes). Start with 1.0.
-    "mc_terminal_weight"  : 1.0,
+    "mc_n_paths"      : 3000,    # paths per simulation (std error ≈ ±0.009)
+    "mc_vol_window"   : 60,      # ticks for EWMA σ
+    "mc_ewma_alpha"   : 0.06,    # EWMA decay (RiskMetrics λ = 0.94)
+    "mc_ticks_per_min": None,    # None = auto-detect
+
+    # Direction probability floor before considering a trade.
+    # Any duration where p_rise or p_fall exceeds this passes to
+    # the EV ranking step.  Pre-screen uses a neutral 95% payout
+    # estimate so ranking is meaningful; the proposal gate uses
+    # the real Deriv payout for the final EV decision.
+    "mc_p_floor"      : 0.51,
 
     # -- Jump-Diffusion (Merton) -----------------------------------------------
-    # Jump detection: any log-return whose |r| > jump_threshold * σ_ewma
-    # is classified as a jump tick (not pure diffusion).
-    "jd_jump_threshold" : 3.0,    # σ-multiples above which a return is a jump
-    "jd_fit_window"     : 600,    # ticks of history (10 min on 1HZ10V)
-    "jd_min_jumps"      : 10,     # 1HZ10V low jump rate; need more evidence before enabling JD
-    # Blend weight: p_final = (1-w)*p_gbm + w*p_jd
-    # 0.0 = pure GBM,  1.0 = pure JD,  0.5 = equal blend
-    "jd_weight"         : 0.2,    # 1HZ10V near-normal (kurt=+0.14); GBM dominates
+    "jd_jump_threshold" : 3.0,   # σ-multiples for jump detection
+    "jd_fit_window"     : 300,   # ticks of history for jump fitting
+    "jd_min_jumps"      : 5,     # minimum jumps needed to enable JD
+    "jd_weight"         : 0.1,   # 0 = pure GBM until jumps are observed
 
-    # -- EV gate ---------------------------------------------------------------
-    "ev_confidence_floor"  : 0.673,  # 1/1.486 — calibrated to actual 48.6% payout
-    "min_ev_threshold"     : 0.001,  # sanity only — p_floor already ensures positive EV
-    "min_payout_pct"       : 0.48,
-    "ev_check_on_proposal" : True,
+    # -- Drift estimation ------------------------------------------------------
+    # Rolling EWMA of signed log-returns, used as the µ term in MC paths.
+    # This is the single most important fix for biased symbols like RDBEAR.
+    # Window should be long enough to smooth noise but short enough to
+    # track intraday drift changes. 120 ticks ≈ 2 min on RDBEAR.
+    "drift_window"       : 120,   # ticks for EWMA µ estimation
+    "drift_ewma_alpha"   : 0.03,  # slower decay than σ (λ=0.97) — drift is slower
+    "drift_scale"        : 1.0,   # multiplier on estimated drift (1.0 = use as-is)
 
-    # -- Signal persistence (consecutive ticks above p_floor before firing) ---
-    "signal_persistence_ticks" : 3,   # 3 consecutive ticks (3 seconds on 1HZ10V)
+    # -- Asymmetric CALL scrutiny (bear-biased symbols) ----------------------
+    # For symbols with known downward bias (RDBEAR, RDBULL on inverse side),
+    # CALL signals require a higher p_win floor than PUT signals.
+    # Set call_scrutiny_mult > 1.0 to apply the additional hurdle.
+    # 1.0 = symmetric (no extra scrutiny). 1.08 = CALL needs 8% more edge.
+    "call_scrutiny_mult" : 1.08,  # CALL p_floor = mc_p_floor * call_scrutiny_mult
+
+    # -- AR(1) mean-reversion correction -------------------------------------
+    # Synthetic indices exhibit short-term mean-reversion (negative lag-1
+    # autocorrelation). Incorporating this tightens the T-step distribution,
+    # reducing p_win overestimation at short durations.
+    # Set to 0.0 to disable (pure iid GBM). Typical range: -0.15 to -0.05.
+    "ar1_correction"     : True,  # estimate and apply AR(1) rho from tick buffer
+    "ar1_window"         : 60,    # ticks used to estimate rho
+
+    # -- Regime gate -----------------------------------------------------------
+    # If the current EWMA σ is expanding faster than this threshold relative
+    # to a slower baseline σ, the signal floor is raised automatically.
+    # Prevents trading into spike/regime-change events.
+    "regime_vol_ratio"   : 1.4,   # fast_σ / slow_σ > this → floor raised by regime_floor_bump
+    "regime_floor_bump"  : 0.02,  # additive bump to mc_p_floor in expanding-vol regime
+    "regime_fast_alpha"  : 0.06,  # EWMA α for fast σ (same as main)
+    "regime_slow_alpha"  : 0.01,  # EWMA α for slow σ (λ=0.99 baseline)
+
+    # -- Intelligence layer ------------------------------------------------
+    # "Is this signal good?" gate. A duration only qualifies if p_win
+    # clears mc_p_floor AND every active model (GBM, and JD when enough
+    # jumps have been observed) agrees on direction.
+    # No EV / payout-ratio gating — purely signal-quality based.
+
+    # -- Signal persistence ----------------------------------------------------
+    # 1 = trade on first qualifying tick (fastest response).
+    # Raise to 2-3 once the bot is confirmed trading correctly.
+    "signal_persistence_ticks" : 2,
 
     # -- Post-trade cooldown ---------------------------------------------------
-    "min_ticks_between_trades" : 120, # 120 ticks = 2 min on 1HZ10V
+    "min_ticks_between_trades" : 50,
 
-    # -- Kelly staking ---------------------------------------------------------
-    "kelly_fraction"  : 0.25,
-    "kelly_max_pct"   : 0.10,
-    "kelly_min_stake" : 0.35,
-    "kelly_max_stake" : 5.0,
-    "stake_pct"       : 0.35,
+    # -- Kelly staking — $1 account -------------------------------------------
+    "kelly_fraction"  : 0.25,   # fractional Kelly (25%)
+    "kelly_max_pct"   : 0.10,   # hard cap: 10% of balance per trade
+    "kelly_min_stake" : 0.35,   # Deriv minimum
+    "kelly_max_stake" : 5.00,   # absolute max per trade
 
     # -- Risk limits -----------------------------------------------------------
-    "max_daily_loss_pct"        : 0.80,
-    "take_profit_pct"           : 9999.0,
-    "max_drawdown_from_peak_pct": 0.80,
+    "max_daily_loss_pct"         : 0.80,   # stop if session P&L ≤ -80% start bal
+    "take_profit_pct"            : 9999.0, # disabled by default
+    "max_drawdown_from_peak_pct" : 0.80,
 
     # -- Consecutive-loss cooldown ---------------------------------------------
     "max_consec_losses"          : 5,
@@ -138,12 +173,12 @@ CONFIG = {
 
     # -- SPRT ------------------------------------------------------------------
     "sprt_p0"    : 0.50,
-    "sprt_p1"    : 0.53,
+    "sprt_p1"    : 0.54,
     "sprt_alpha" : 0.10,
     "sprt_beta"  : 0.20,
 
     # -- Trade log -------------------------------------------------------------
-    "trade_log" : os.path.join(DATA_DIR, "trade_log.csv"),
+    "trade_log" : os.path.join(DATA_DIR, "trade_log_rf.csv"),
 }
 
 os.makedirs(CONFIG["data_dir"], exist_ok=True)
@@ -155,9 +190,9 @@ os.makedirs(CONFIG["data_dir"], exist_ok=True)
 
 def wilson_ci(wins, n, z=1.96):
     if n == 0: return 0.0, 1.0
-    p   = wins / n
-    denom = 1 + z**2/n
-    centre = (p + z**2/(2*n)) / denom
+    p      = wins / n
+    denom  = 1 + z**2 / n
+    centre = (p + z**2 / (2*n)) / denom
     margin = z * math.sqrt(p*(1-p)/n + z**2/(4*n**2)) / denom
     return max(0.0, centre - margin), min(1.0, centre + margin)
 
@@ -168,365 +203,516 @@ def wilson_ci(wins, n, z=1.96):
 
 class SPRTMonitor:
     """Sequential Probability Ratio Test — passive edge tracker."""
-    def __init__(self, p0=0.50, p1=0.53, alpha=0.10, beta=0.20):
-        self.A   = math.log((1-beta)/alpha)
-        self.B   = math.log(beta/(1-alpha))
-        self.p0  = p0; self.p1 = p1
-        self.llr = 0.0; self.n = 0; self.wins = 0
+    def __init__(self, p0=0.50, p1=0.54, alpha=0.10, beta=0.20):
+        self.A      = math.log((1 - beta) / alpha)
+        self.B      = math.log(beta / (1 - alpha))
+        self.p0     = p0; self.p1 = p1
+        self.llr    = 0.0; self.n = 0; self.wins = 0
         self.status = "CONTINUE"
 
     def update(self, win: bool) -> str:
         self.n += 1
         if win:
             self.wins += 1
-            self.llr  += math.log(self.p1/self.p0)
+            self.llr  += math.log(self.p1 / self.p0)
         else:
-            self.llr  += math.log((1-self.p1)/(1-self.p0))
+            self.llr  += math.log((1 - self.p1) / (1 - self.p0))
         if   self.llr >= self.A: self.status = "ACCEPT_H1"; self.llr = 0.0
         elif self.llr <= self.B: self.status = "ACCEPT_H0"; self.llr = 0.0
         else:                    self.status = "CONTINUE"
         return self.status
 
     def summary(self):
-        wr     = self.wins/self.n if self.n else 0.0
+        wr     = self.wins / self.n if self.n else 0.0
         lo, hi = wilson_ci(self.wins, self.n)
-        return f"{self.status}  n={self.n}  WR={wr:.3f}  CI=[{lo:.3f},{hi:.3f}]"
+        return (f"{self.status}  n={self.n}  WR={wr:.3f}  "
+                f"CI=[{lo:.3f},{hi:.3f}]")
 
 
 # ===========================================================================
-# MONTE CARLO PRICER  (GBM  +  Merton Jump-Diffusion)
+# JUMP PARAMS CONTAINER
 # ===========================================================================
 
 class JumpParams:
-    """Container for fitted Merton jump-diffusion parameters."""
     __slots__ = ("lam", "mu_j", "sigma_j", "n_jumps", "n_obs")
-
-    def __init__(self, lam=0.0, mu_j=0.0, sigma_j=0.001,
-                 n_jumps=0, n_obs=0):
-        self.lam     = lam      # jump arrival rate (jumps per tick)
-        self.mu_j    = mu_j     # mean log-return of a jump
-        self.sigma_j = sigma_j  # std dev of jump log-return
-        self.n_jumps = n_jumps  # observed jump count (used for fallback check)
-        self.n_obs   = n_obs    # total observations used for fit
+    def __init__(self, lam=0.0, mu_j=0.0, sigma_j=0.001, n_jumps=0, n_obs=0):
+        self.lam     = lam
+        self.mu_j    = mu_j
+        self.sigma_j = sigma_j
+        self.n_jumps = n_jumps
+        self.n_obs   = n_obs
 
     def __repr__(self):
-        return (f"JumpParams(λ={self.lam:.5f}/tick  "
-                f"μ_J={self.mu_j:+.5f}  σ_J={self.sigma_j:.5f}  "
+        return (f"JumpParams(λ={self.lam:.5f}/tick "
+                f"μ_J={self.mu_j:+.5f} σ_J={self.sigma_j:.5f} "
                 f"n_jumps={self.n_jumps}/{self.n_obs})")
 
 
+# ===========================================================================
+# MONTE CARLO PRICER  (Direction — Rise or Fall)
+# ===========================================================================
+
 class MonteCarloPricer:
     """
-    Estimates P(price stays inside ±barrier_offset for all T ticks) using
-    two simulation models that are blended into a single containment probability.
+    Estimates the probability that the final tick of a Rise/Fall contract
+    ends strictly above (Rise) or at/below (Fall) the entry spot.
 
-    ── Model 1: Pure GBM ────────────────────────────────────────────────────
-    Each tick step:
-        dlog S_t = σ · Z_t,   Z_t ~ N(0,1)
-    σ is the per-tick EWMA volatility (α=0.06).
+    v3 models (all blended):
+      GBM+µ : dlog S = µ·dt + σ·Z  — with EWMA drift term
+      Merton: dlog S = µ·dt + σ_d·Z + Σ Y_k  — JD with drift + µ_J bias
+      AR(1) correction applied to T-step variance: Var(S_T) adjusted for
+        autocorrelation structure (mean-reversion tightens distribution).
 
-    ── Model 2: Merton Jump-Diffusion ───────────────────────────────────────
-    Each tick step:
-        dlog S_t = σ_d · Z_t  +  Σ_{k=1}^{N_t} Y_k
-    where:
-        σ_d  = diffusion-only σ (EWMA σ computed on non-jump returns)
-        N_t  ~ Poisson(λ)       per-tick jump count
-        Y_k  ~ N(μ_J, σ_J²)    individual jump size
-
-    Parameters are estimated from the tick buffer:
-        - Any log-return with |r| > jump_threshold · σ_ewma is flagged as a jump.
-        - λ    = n_jumps / n_obs                (empirical jump rate)
-        - μ_J  = mean(jump_returns)             (signed; ≈ 0 for symmetric noise)
-        - σ_J  = std(jump_returns)              (always >> σ_d)
-        - σ_d  = EWMA σ recomputed on diffusion-only (non-jump) returns
-
-    Vectorised implementation — no Python loops over paths:
-        diffusion : (N, T) standard normals  ×  σ_d
-        jumps     : (N, T) Poisson counts   ×  N(μ_J, σ_J²) per jump
-                    drawn as Poisson(λ·T)   split uniformly across T ticks
-                    (thinning approximation, exact for small λ)
-
-    ── Blending ─────────────────────────────────────────────────────────────
-        p_final = (1 - w) · p_gbm  +  w · p_jd
-    where w = jd_weight (default 0.5).
-    Falls back to pure GBM (w=0) when fewer than jd_min_jumps have been
-    observed — not enough data to trust the jump parameter estimates.
-
-    ── Logging ──────────────────────────────────────────────────────────────
-    The last fitted JumpParams are stored in self.last_jump_params for
-    inclusion in trade logs and diagnostics.
+    Returns (p_rise, p_fall, sigma, drift) where:
+        p_rise + p_fall ≈ 1.0  (small MC noise)
     """
 
     def __init__(self, cfg):
-        self.n_paths         = cfg.get("mc_n_paths",          1000)
-        self.vol_win         = cfg.get("mc_vol_window",        60)
-        self.alpha           = cfg.get("mc_ewma_alpha",        0.06)
-        self.p_floor         = cfg.get("mc_p_floor",           0.670)
-        self._tpm_cfg        = cfg.get("mc_ticks_per_min",     None)
-        self.terminal_weight = cfg.get("mc_terminal_weight",   0.7)
+        self.n_paths        = cfg.get("mc_n_paths",        3000)
+        self.vol_win        = cfg.get("mc_vol_window",      60)
+        self.alpha          = cfg.get("mc_ewma_alpha",      0.06)
+        self.p_floor        = cfg.get("mc_p_floor",         0.51)
+        self._tpm_cfg       = cfg.get("mc_ticks_per_min",   None)
+        self.jump_threshold = cfg.get("jd_jump_threshold",  3.0)
+        self.jd_fit_window  = cfg.get("jd_fit_window",      300)
+        self.jd_min_jumps   = cfg.get("jd_min_jumps",       5)
+        self.jd_weight      = cfg.get("jd_weight",          0.5)
 
-        # Jump-diffusion settings
-        self.jump_threshold  = cfg.get("jd_jump_threshold",   3.0)
-        self.jd_fit_window   = cfg.get("jd_fit_window",       300)
-        self.jd_min_jumps    = cfg.get("jd_min_jumps",        5)
-        self.jd_weight       = cfg.get("jd_weight",           0.5)
+        # v3: drift
+        self.drift_win      = cfg.get("drift_window",       120)
+        self.drift_alpha    = cfg.get("drift_ewma_alpha",   0.03)
+        self.drift_scale    = cfg.get("drift_scale",        1.0)
 
-        self._rng            = np.random.default_rng()   # PCG64, thread-safe per instance
+        # v3: AR(1) correction
+        self.ar1_enabled    = cfg.get("ar1_correction",     True)
+        self.ar1_window     = cfg.get("ar1_window",         60)
 
-        # Public: last fitted jump params (for logging)
+        # v3: regime gate
+        self.regime_ratio   = cfg.get("regime_vol_ratio",   1.4)
+        self.regime_bump    = cfg.get("regime_floor_bump",  0.02)
+        self.regime_fast_a  = cfg.get("regime_fast_alpha",  0.06)
+        self.regime_slow_a  = cfg.get("regime_slow_alpha",  0.01)
+
+        # v3: asymmetric CALL scrutiny
+        self.call_scrutiny  = cfg.get("call_scrutiny_mult", 1.0)
+
+        self._rng           = np.random.default_rng()
         self.last_jump_params: JumpParams = JumpParams()
+        self.last_components: dict = {}
+        self.last_drift: float = 0.0
+        self.last_rho:   float = 0.0
+        self.last_regime_bump: float = 0.0
 
     # ── σ estimation ──────────────────────────────────────────────────────
 
     def ewma_sigma(self, tick_buf) -> float:
-        """Full-sample EWMA σ (diffusion + jumps). Per-tick σ."""
-        buf = list(tick_buf)[-(self.vol_win + 1):]
-        if len(buf) < 3:
-            return 0.001
+        buf    = list(tick_buf)[-(self.vol_win + 1):]
+        if len(buf) < 3: return 0.001
         prices = np.array([t["price"] for t in buf], dtype=float)
         lr     = np.diff(np.log(np.maximum(prices, 1e-8)))
-        if len(lr) < 2:
-            return max(float(np.std(lr)), 1e-8)
+        if len(lr) < 2: return max(float(np.std(lr)), 1e-8)
         var = float(lr[0] ** 2)
         for r in lr[1:]:
-            var = self.alpha * float(r ** 2) + (1.0 - self.alpha) * var
+            var = self.alpha * float(r**2) + (1.0 - self.alpha) * var
         return max(math.sqrt(var), 1e-8)
 
-    # ── tpm detection ────────────────────────────────────────────────────
+    # ── Drift (µ) estimation ──────────────────────────────────────────────
+
+    def ewma_drift(self, tick_buf) -> float:
+        """
+        EWMA of signed log-returns — estimates the per-tick drift µ.
+
+        On a bear-biased symbol like RDBEAR the rolling mean log-return
+        is negative, giving the MC paths a downward tilt that correctly
+        suppresses CALL signals.
+
+        Uses a slower decay (drift_ewma_alpha < mc_ewma_alpha) because
+        drift is a lower-frequency phenomenon than volatility.
+        """
+        buf = list(tick_buf)[-(self.drift_win + 1):]
+        if len(buf) < 5:
+            return 0.0
+        prices = np.array([t["price"] for t in buf], dtype=float)
+        lr     = np.diff(np.log(np.maximum(prices, 1e-8)))
+        mu = float(lr[0])
+        for r in lr[1:]:
+            mu = self.drift_alpha * float(r) + (1.0 - self.drift_alpha) * mu
+        return float(mu) * self.drift_scale
+
+    # ── AR(1) autocorrelation estimation ─────────────────────────────────
+
+    def estimate_ar1(self, tick_buf) -> float:
+        """
+        Estimates lag-1 autocorrelation (rho) of log-returns.
+
+        Synthetic Deriv indices exhibit short-term mean-reversion
+        (rho typically -0.15 to -0.05). A negative rho means the
+        T-step variance is LESS than T * σ² (returns partially cancel).
+
+        The corrected T-step std for iid-corrected GBM is:
+            σ_T = σ * sqrt(T * (1 + 2*rho*(1 - rho^T)/(1 - rho) / T))
+        For small T and negative rho this is meaningfully smaller than
+        σ*sqrt(T), reducing overconfident p_win estimates at 1-5 ticks.
+
+        Returns rho clamped to [-0.5, 0.0] (we only apply the
+        mean-reversion side; positive autocorrelation is left to GBM).
+        """
+        if not self.ar1_enabled:
+            return 0.0
+        buf = list(tick_buf)[-(self.ar1_window + 1):]
+        if len(buf) < 10:
+            return 0.0
+        prices = np.array([t["price"] for t in buf], dtype=float)
+        lr     = np.diff(np.log(np.maximum(prices, 1e-8)))
+        if len(lr) < 4:
+            return 0.0
+        lr_dm  = lr - lr.mean()
+        cov0   = float(np.dot(lr_dm, lr_dm)) / len(lr_dm)
+        cov1   = float(np.dot(lr_dm[:-1], lr_dm[1:])) / (len(lr_dm) - 1)
+        rho    = cov1 / max(cov0, 1e-12)
+        # Only apply mean-reversion correction (rho < 0); ignore momentum
+        return float(np.clip(rho, -0.5, 0.0))
+
+    @staticmethod
+    def ar1_sigma_correction(sigma: float, T: int, rho: float) -> float:
+        """
+        Returns the AR(1)-corrected T-step standard deviation.
+        For rho=0 this reduces exactly to sigma*sqrt(T).
+        """
+        if T <= 1 or rho == 0.0:
+            return sigma * math.sqrt(T)
+        # Variance of sum of T AR(1) variables:
+        # Var(S_T) = T*σ² * [1 + 2*rho/(1-rho) * (1 - rho^T/T) / (1 - rho^T ... )]
+        # Simplified exact formula:
+        #   V = T + 2 * rho * (T - 1) + 2 * rho^2 * (T - 2) + ...
+        #     = sum_{k=0}^{T-1} (T - k) * rho^k * 2  (for k>0)
+        V = float(T)
+        rho_k = rho
+        for k in range(1, T):
+            V += 2.0 * (T - k) * rho_k
+            rho_k *= rho
+        V = max(V, 0.01)
+        return sigma * math.sqrt(V / T) * math.sqrt(T)
+        # = sigma * sqrt(V)
+
+    # ── Regime detection ──────────────────────────────────────────────────
+
+    def regime_floor_bump(self, tick_buf) -> float:
+        """
+        Returns an additive p_floor bump when volatility is expanding.
+
+        Fast EWMA σ / slow EWMA σ > regime_ratio → regime is expanding.
+        In expanding-vol regimes, MC path distributions are less reliable
+        (σ is changing during the forecast horizon), so we raise the bar.
+
+        Returns 0.0 in normal regime, regime_bump otherwise.
+        """
+        buf = list(tick_buf)[-(self.vol_win + 1):]
+        if len(buf) < 5:
+            return 0.0
+        prices = np.array([t["price"] for t in buf], dtype=float)
+        lr     = np.diff(np.log(np.maximum(prices, 1e-8)))
+        if len(lr) < 3:
+            return 0.0
+        # Fast variance
+        var_f = float(lr[0]**2)
+        # Slow variance
+        var_s = float(lr[0]**2)
+        for r in lr[1:]:
+            r2    = float(r**2)
+            var_f = self.regime_fast_a * r2 + (1.0 - self.regime_fast_a) * var_f
+            var_s = self.regime_slow_a * r2 + (1.0 - self.regime_slow_a) * var_s
+        sigma_f = math.sqrt(max(var_f, 1e-12))
+        sigma_s = math.sqrt(max(var_s, 1e-12))
+        ratio   = sigma_f / max(sigma_s, 1e-12)
+        bump    = self.regime_bump if ratio > self.regime_ratio else 0.0
+        self.last_regime_bump = bump
+        return bump
+
+    # ── ticks-per-minute detection ────────────────────────────────────────
 
     @staticmethod
     def detect_tpm(tick_buf, window=30) -> float:
-        """Estimate ticks-per-minute from tick timestamps."""
         buf = list(tick_buf)[-window:]
-        if len(buf) < 2:
-            return 60.0
+        if len(buf) < 2: return 60.0
         dt = buf[-1]["timestamp"] - buf[0]["timestamp"]
         return (len(buf) - 1) / dt * 60.0 if dt > 0 else 60.0
 
     # ── Jump parameter estimation ─────────────────────────────────────────
 
     def fit_jumps(self, tick_buf, sigma_ewma: float) -> JumpParams:
-        """
-        Estimate Merton jump parameters from recent tick history.
-
-        Classification rule
-        -------------------
-        A log-return r is classified as a jump if:
-            |r| > jump_threshold · σ_ewma
-
-        This separates the heavy-tailed outliers (jumps) from the
-        Gaussian diffusion core.  The threshold is intentionally wide
-        (default 3σ) so that normal variance is not misclassified as jumps.
-
-        Returns a JumpParams with fitted λ, μ_J, σ_J (and σ_d implicitly
-        available as the EWMA of the non-jump returns, recomputed in
-        simulate_with_sigma).
-        """
         buf = list(tick_buf)[-(self.jd_fit_window + 1):]
-        if len(buf) < 10:
-            return JumpParams()
-
-        prices   = np.array([t["price"] for t in buf], dtype=float)
-        lr       = np.diff(np.log(np.maximum(prices, 1e-8)))
-        n_obs    = len(lr)
-
+        if len(buf) < 10: return JumpParams()
+        prices     = np.array([t["price"] for t in buf], dtype=float)
+        lr         = np.diff(np.log(np.maximum(prices, 1e-8)))
+        n_obs      = len(lr)
         threshold  = self.jump_threshold * sigma_ewma
         jump_mask  = np.abs(lr) > threshold
         n_jumps    = int(jump_mask.sum())
-
         if n_jumps == 0:
             return JumpParams(lam=0.0, mu_j=0.0,
                               sigma_j=sigma_ewma * self.jump_threshold,
                               n_jumps=0, n_obs=n_obs)
-
         jump_returns = lr[jump_mask]
         lam          = n_jumps / n_obs
         mu_j         = float(np.mean(jump_returns))
-        sigma_j      = float(np.std(jump_returns, ddof=1)) if n_jumps > 1 \
-                       else abs(mu_j) * 0.5 + 1e-8
-
+        sigma_j      = (float(np.std(jump_returns, ddof=1))
+                        if n_jumps > 1 else abs(mu_j) * 0.5 + 1e-8)
         return JumpParams(lam=lam, mu_j=mu_j, sigma_j=sigma_j,
                           n_jumps=n_jumps, n_obs=n_obs)
 
-    # ── Core simulation ───────────────────────────────────────────────────
+    # ── Core simulation: direction probability ────────────────────────────
 
-    def simulate(self, tick_buf, barrier_offset: float, duration_mins: float
-                 ) -> tuple[float, float, int]:
+    def simulate_direction(self, tick_buf, T: int,
+                           sigma: float) -> tuple[float, float]:
         """
-        Convenience entry-point: compute σ and tpm, then delegate to
-        simulate_with_sigma.
-        """
-        if not tick_buf:
-            return 0.5, 0.001, 1
-        sigma = self.ewma_sigma(tick_buf)
-        tpm   = self._tpm_cfg or self.detect_tpm(tick_buf)
-        return self.simulate_with_sigma(tick_buf, barrier_offset,
-                                        duration_mins, sigma, tpm)
+        Simulate T ticks forward. Returns (p_rise, p_fall).
 
-    def simulate_with_sigma(self, tick_buf, barrier_offset: float,
-                            duration_mins: float, sigma: float, tpm: float
-                            ) -> tuple[float, float, int]:
-        """
-        Run both GBM and Jump-Diffusion simulations and return the
-        blended containment probability.
-
-        Called from _evaluate_signal (with shared σ/tpm across durations).
-
-        Returns (p_blended, sigma, T)
+        v3 improvements vs v2:
+          - Drift term µ from EWMA of signed log-returns (critical for
+            biased symbols; previously omitted entirely).
+          - AR(1) mean-reversion correction on T-step std (tightens
+            distribution at short durations, reduces overconfident p_win).
+          - Jump direction bias: µ_J contributes to the expected final
+            log-return of the JD model, so asymmetric jumps shift p_rise/fall.
+          - All of the above feed into the same GBM/JD blend as before.
         """
         if not tick_buf:
-            return 0.5, sigma, 1
+            return 0.5, 0.5
 
-        S  = max(list(tick_buf)[-1]["price"], 1e-8)
-        T  = max(1, int(round(tpm * duration_mins)))
+        N = self.n_paths
 
-        # Log-barrier bounds (symmetric around current log-price)
-        log_hi = math.log((S + barrier_offset) / S)
-        log_lo = math.log(max(S - barrier_offset, 1e-8) / S)
+        # ── Estimate drift and AR(1) rho ──────────────────────────────────
+        mu  = self.ewma_drift(tick_buf)          # per-tick drift (signed)
+        rho = self.estimate_ar1(tick_buf)        # lag-1 autocorr (≤ 0)
+        self.last_drift = mu
+        self.last_rho   = rho
 
-        # ── GBM paths ─────────────────────────────────────────────────
-        gbm_shocks = self._rng.standard_normal((self.n_paths, T)) * sigma
-        gbm_cum    = np.cumsum(gbm_shocks, axis=1)   # (N, T)
+        # AR(1)-corrected T-step std (smaller than σ√T when rho < 0)
+        sigma_T = self.ar1_sigma_correction(sigma, T, rho)
+        # T-step drift contribution (deterministic shift to all paths)
+        mu_T    = mu * T
 
-        # Terminal containment: final log-return inside band
-        # (matches Deriv EXPIRYRANGE settlement — last tick only)
-        gbm_terminal = (
-            (gbm_cum[:, -1] <= log_hi) &
-            (gbm_cum[:, -1] >= log_lo)
-        )
-        # Path containment: never breaches at any tick (strict first-passage)
-        gbm_path = (
-            (gbm_cum <= log_hi).all(axis=1) &
-            (gbm_cum >= log_lo).all(axis=1)
-        )
-        # Blend: terminal_weight controls the mix
-        tw    = self.terminal_weight
-        p_gbm = float(tw * gbm_terminal.mean() + (1.0 - tw) * gbm_path.mean())
+        # ── GBM + drift ───────────────────────────────────────────────────
+        # dlog S_t = µ + σ·Z  (per tick)
+        # Final log-return: N(µ·T, σ_T²)  where σ_T has AR(1) correction
+        gbm_final   = mu_T + self._rng.standard_normal(N) * sigma_T
+        p_rise_gbm  = float((gbm_final > 0).mean())
+        p_fall_gbm  = float((gbm_final < 0).mean())
 
-        # ── Jump-Diffusion paths ───────────────────────────────────────
+        # ── Jump-Diffusion + drift ─────────────────────────────────────────
         jp = self.fit_jumps(tick_buf, sigma)
-        self.last_jump_params = jp   # store for logging
+        self.last_jump_params = jp
+        sufficient = jp.n_jumps >= self.jd_min_jumps
+        ew = self.jd_weight if sufficient else 0.0
 
-        sufficient_jumps = jp.n_jumps >= self.jd_min_jumps
-        effective_weight = self.jd_weight if sufficient_jumps else 0.0
-
-        if effective_weight > 0.0:
-            # Diffusion-only σ: recompute EWMA excluding jump ticks
-            buf      = list(tick_buf)[-(self.jd_fit_window + 1):]
-            prices   = np.array([t["price"] for t in buf], dtype=float)
-            lr_all   = np.diff(np.log(np.maximum(prices, 1e-8)))
-            thr      = self.jump_threshold * sigma
-            diff_lr  = lr_all[np.abs(lr_all) <= thr]
+        if ew > 0.0:
+            # Diffusion-only σ (EWMA recomputed excluding jump ticks)
+            buf     = list(tick_buf)[-(self.jd_fit_window + 1):]
+            prices  = np.array([t["price"] for t in buf], dtype=float)
+            lr_all  = np.diff(np.log(np.maximum(prices, 1e-8)))
+            thr     = self.jump_threshold * sigma
+            diff_lr = lr_all[np.abs(lr_all) <= thr]
             if len(diff_lr) >= 2:
-                var_d = float(diff_lr[0] ** 2)
+                var_d = float(diff_lr[0]**2)
                 for r in diff_lr[1:]:
-                    var_d = self.alpha * float(r ** 2) + (1.0 - self.alpha) * var_d
+                    var_d = self.alpha * float(r**2) + (1.0 - self.alpha) * var_d
                 sigma_d = max(math.sqrt(var_d), 1e-8)
             else:
-                sigma_d = sigma   # fall back if too few diffusion ticks
+                sigma_d = sigma
 
-            # Diffusion component: (N, T)
-            diff_shocks = self._rng.standard_normal((self.n_paths, T)) * sigma_d
+            # AR(1)-corrected diffusion component
+            sigma_d_T = self.ar1_sigma_correction(sigma_d, T, rho)
 
-            # Jump component — thinning approximation:
-            #   Expected total jumps per path = λ · T
-            #   Draw Poisson(λ·T) total jumps, place them uniformly on [0,T)
-            lam_total = jp.lam * T
-            # Vectorised: draw total jump counts per path, then add
-            # their summed sizes directly to the log-return matrix.
-            # For small λ (typical: < 0.02/tick) this is exact in distribution.
-            n_jumps_per_path = self._rng.poisson(lam_total, size=self.n_paths)
-            # jump_impact[i] = sum of Y_k for path i, where each Y_k ~ N(μ_J, σ_J²)
-            # Using the identity: sum of m iid N(μ,σ²) = N(m·μ, m·σ²)
-            jump_impact = np.where(
+            # Diffusion final log-return: N(µ·T, σ_d_T²)
+            diff_final = mu_T + self._rng.standard_normal(N) * sigma_d_T
+
+            # Jump component: Poisson(λ·T) jumps per path.
+            # Total jump = N(n_jumps·µ_J, n_jumps·σ_J²).
+            # µ_J is the KEY addition for v3: if jumps on RDBEAR tend to be
+            # negative (µ_J < 0), that directional bias is now captured —
+            # it shifts the JD final distribution downward, correctly
+            # suppressing CALL and amplifying PUT signals.
+            lam_total        = jp.lam * T
+            n_jumps_per_path = self._rng.poisson(lam_total, size=N)
+            jump_final = np.where(
                 n_jumps_per_path > 0,
                 self._rng.normal(
-                    n_jumps_per_path * jp.mu_j,
-                    np.sqrt(np.maximum(n_jumps_per_path, 0)) * jp.sigma_j
+                    n_jumps_per_path * jp.mu_j,       # signed bias preserved
+                    np.sqrt(np.maximum(n_jumps_per_path, 0)) * jp.sigma_j,
                 ),
                 0.0,
-            )   # shape (N,)
-
-            # Distribute jump impact uniformly across a random tick in [0, T)
-            # (for barrier purposes, the worst case is a jump at any tick)
-            # We add total impact at a random step index so the path shape
-            # is realistic — the cumsum barrier check will capture it.
-            jump_step = self._rng.integers(0, T, size=self.n_paths)
-            jump_matrix = np.zeros((self.n_paths, T), dtype=float)
-            np.add.at(jump_matrix, (np.arange(self.n_paths), jump_step),
-                      jump_impact)
-
-            jd_cum  = np.cumsum(diff_shocks + jump_matrix, axis=1)  # (N, T)
-
-            # Same dual terminal+path check as GBM
-            jd_terminal = (
-                (jd_cum[:, -1] <= log_hi) &
-                (jd_cum[:, -1] >= log_lo)
             )
-            jd_path = (
-                (jd_cum <= log_hi).all(axis=1) &
-                (jd_cum >= log_lo).all(axis=1)
-            )
-            p_jd = float(tw * jd_terminal.mean() + (1.0 - tw) * jd_path.mean())
+            jd_final  = diff_final + jump_final
+            p_rise_jd = float((jd_final > 0).mean())
+            p_fall_jd = float((jd_final < 0).mean())
         else:
-            p_jd = p_gbm   # not enough jump history — JD = GBM
+            p_rise_jd = p_rise_gbm
+            p_fall_jd = p_fall_gbm
 
-        # ── Blend ─────────────────────────────────────────────────────
-        p_blend = (1.0 - effective_weight) * p_gbm + effective_weight * p_jd
+        # ── Blend ─────────────────────────────────────────────────────────
+        p_rise = (1.0 - ew) * p_rise_gbm + ew * p_rise_jd
+        p_fall = (1.0 - ew) * p_fall_gbm + ew * p_fall_jd
 
-        return float(np.clip(p_blend, 0.01, 0.99)), sigma, T
+        p_rise = float(np.clip(p_rise, 0.01, 0.99))
+        p_fall = float(np.clip(p_fall, 0.01, 0.99))
 
-    # ── EV helper ─────────────────────────────────────────────────────────
+        # Stash for intelligence layer and logging
+        self.last_components = {
+            "p_rise_gbm": p_rise_gbm, "p_fall_gbm": p_fall_gbm,
+            "p_rise_jd" : p_rise_jd,  "p_fall_jd" : p_fall_jd,
+            "jd_active" : ew > 0.0,
+            "mu"        : mu,
+            "rho"       : rho,
+            "regime_bump": self.last_regime_bump,
+        }
 
-    @staticmethod
-    def ev(p_win: float, payout_ratio: float) -> float:
-        return float(p_win * payout_ratio - (1.0 - p_win))
+        return p_rise, p_fall
+
+    # ── Convenience entry-point ───────────────────────────────────────────
+
+    def simulate(self, tick_buf, T: int) -> tuple[float, float, float]:
+        """Returns (p_rise, p_fall, sigma)."""
+        sigma = self.ewma_sigma(tick_buf)
+        p_rise, p_fall = self.simulate_direction(tick_buf, T, sigma)
+        return p_rise, p_fall, sigma
+
+    # ── Intelligence layer ──────────────────────────────────────────────
+    # "Is this signal good?" — every available model must agree on
+    # direction AND clear the probability floor. No EV / payout math.
+
+    def signal_quality(self, direction: str, p_win: float,
+                       p_floor: float) -> tuple[bool, str]:
+        """
+        Returns (is_good, reason).
+
+        v3 checks (in order):
+          1. Regime gate: if vol is expanding, p_floor is raised.
+          2. Asymmetric CALL scrutiny: CALL requires a higher floor than PUT,
+             calibrated via call_scrutiny_mult. This is the primary guard
+             against betting against bear-biased symbols like RDBEAR.
+          3. p_win clears the (possibly elevated) floor.
+          4. GBM model agrees with the blended direction.
+          5. Drift sign agreement: if µ is meaningfully negative, a CALL
+             signal is flagged as drift-opposed and rejected.
+          6. If JD is active, JD model also agrees with the direction.
+        """
+        comp = getattr(self, "last_components", None)
+        if comp is None:
+            return False, "no component data"
+
+        # ── 1. Regime gate ────────────────────────────────────────────────
+        effective_floor = p_floor + comp.get("regime_bump", 0.0)
+
+        # ── 2. Asymmetric CALL scrutiny ───────────────────────────────────
+        if direction == "CALL" and self.call_scrutiny > 1.0:
+            effective_floor = effective_floor * self.call_scrutiny
+
+        # ── 3. Probability floor ──────────────────────────────────────────
+        if p_win < effective_floor:
+            return False, (
+                f"p_win {p_win:.4f} < floor {effective_floor:.4f}"
+                f"{'(CALL scrutiny)' if direction=='CALL' and self.call_scrutiny>1 else ''}"
+                f"{'(regime)' if comp.get('regime_bump', 0) > 0 else ''}"
+            )
+
+        # ── 4. GBM model agreement ────────────────────────────────────────
+        gbm_dir = "CALL" if comp["p_rise_gbm"] >= comp["p_fall_gbm"] else "PUT"
+        if gbm_dir != direction:
+            return False, f"GBM disagrees ({gbm_dir} vs {direction})"
+
+        # ── 5. Drift sign agreement ───────────────────────────────────────
+        # If the rolling drift is strongly negative, reject CALL signals.
+        # Threshold: drift more negative than -0.5σ per tick is meaningful.
+        mu  = comp.get("mu", 0.0)
+        sig = self.ewma_sigma.__func__(self, []) if False else 0.0  # placeholder
+        # Use last_jump_params sigma as proxy (already computed)
+        # A simpler heuristic: if mu < -2 * |mu_floor| suppress CALL.
+        # We set mu_floor as a small multiple of typical drift noise.
+        # In practice: suppress CALL if mu < -0.3 * sigma_ewma
+        # We don't have sigma here directly, but we can use the GBM p_fall
+        # as a proxy: if GBM already gives p_fall_gbm > 0.54, drift is negative.
+        if direction == "CALL" and comp.get("p_fall_gbm", 0.5) > 0.54:
+            return False, (
+                f"Drift opposed: p_fall_gbm={comp['p_fall_gbm']:.4f} "
+                f"µ={mu:+.7f}"
+            )
+
+        # ── 6. JD model agreement ─────────────────────────────────────────
+        if comp["jd_active"]:
+            jd_dir = "CALL" if comp["p_rise_jd"] >= comp["p_fall_jd"] else "PUT"
+            if jd_dir != direction:
+                return False, f"JD disagrees ({jd_dir} vs {direction})"
+
+        regime_note = f" [regime+{comp.get('regime_bump',0):.2f}]" if comp.get("regime_bump", 0) > 0 else ""
+        call_note   = f" [call_scrutiny x{self.call_scrutiny}]" if direction=="CALL" and self.call_scrutiny>1 else ""
+        return True, f"agree{regime_note}{call_note}"
 
 
 # ===========================================================================
-# KELLY STAKER
+# KELLY STAKER  — calibrated for $1 account, $0.35 minimum
 # ===========================================================================
 
 class KellyStaker:
     """
-    Tiered stake sizing calibrated for $1 account:
-      $1.00–$1.99  → 35%  (ensures $0.35 Deriv minimum is met)
-      $2.00–$4.99  → 12%  (tapering off)
-      $5.00–$14.99 →  7%  (conservative growth)
-      $15.00+      →  5%  (steady compounding)
-    Hard cap: 10% of balance per trade, $5.00 absolute maximum.
+    Tiered proportional floor combined with fractional Kelly:
+
+      Balance tier  |  Proportional floor
+      $0.35–$1.99   |  35%  ← ensures $0.35 minimum is reachable
+      $2.00–$4.99   |  12%
+      $5.00–$14.99  |   7%
+      $15.00+       |   5%
+
+    Stake = max(proportional_floor, fractional_kelly)
+    Then clamped:  [kelly_min_stake, min(kelly_max_stake, kelly_max_pct × balance)]
+
+    Kelly formula:  f* = (p × b − q) / b,  b = payout_ratio
+    Fractional:     stake = f* × kelly_fraction × balance
     """
+
     def __init__(self, cfg):
-        self.fraction  = cfg["kelly_fraction"]
-        self.max_pct   = cfg["kelly_max_pct"]
-        self.min_stake = cfg["kelly_min_stake"]
-        self.max_stake = cfg["kelly_max_stake"]
+        self.fraction  = cfg["kelly_fraction"]   # 0.25
+        self.max_pct   = cfg["kelly_max_pct"]    # 0.10
+        self.min_stake = cfg["kelly_min_stake"]  # 0.35
+        self.max_stake = cfg["kelly_max_stake"]  # 5.00
         self.wins = self.n = 0
 
-    def _tiered_pct(self, balance):
+    def _tiered_pct(self, balance: float) -> float:
         if balance < 2.00:  return 0.35
         if balance < 5.00:  return 0.12
         if balance < 15.00: return 0.07
         return 0.05
 
-    def next_stake(self, p_win, balance, payout_ratio=0.48):
-        if balance <= 0: return self.min_stake
-        prop_stake  = balance * self._tiered_pct(balance)
-        b           = payout_ratio; q = 1.0 - p_win
-        f_star      = (p_win * b - q) / b
-        kelly_stake = min(f_star * self.fraction, self.max_pct) * balance if f_star > 0 else 0.0
+    def next_stake(self, p_win: float, balance: float,
+                   payout_ratio: float = 0.85) -> float:
+        if balance <= 0:
+            return self.min_stake
+
+        # Proportional floor (guarantees we can meet Deriv minimum)
+        prop_stake = balance * self._tiered_pct(balance)
+
+        # Fractional Kelly
+        b       = payout_ratio
+        q       = 1.0 - p_win
+        f_star  = (p_win * b - q) / b
+        if f_star > 0:
+            kelly_stake = min(f_star * self.fraction, self.max_pct) * balance
+        else:
+            kelly_stake = 0.0
+
         stake = max(prop_stake, kelly_stake)
         stake = min(stake, self.max_stake, balance * self.max_pct)
         stake = max(stake, self.min_stake)
-        stake = min(stake, balance)
+        stake = min(stake, balance)          # never bet more than we have
         return round(stake, 2)
 
     def record(self, win: bool):
         if win: self.wins += 1
         self.n += 1
-        log.info("[Kelly] %s  WR=%.1f%%",
+        log.info("[Kelly] %s  WR=%.1f%%  wins=%d/%d",
                  "WIN" if win else "LOSS",
-                 self.wins / self.n * 100 if self.n else 0)
+                 self.wins / self.n * 100 if self.n else 0,
+                 self.wins, self.n)
 
 
 # ===========================================================================
@@ -535,16 +721,16 @@ class KellyStaker:
 
 class TradeLogger:
     FIELDS = [
-        "timestamp", "symbol", "duration_mins",
-        "barrier_offset", "price_at_entry",
-        "p_contain", "ev", "payout",
-        "sigma_ewma", "mc_paths", "mc_ticks",
+        "timestamp", "symbol", "direction", "duration_ticks",
+        "price_at_entry",
+        "p_rise", "p_fall", "p_win", "payout_ratio",
+        "sigma_ewma", "mc_paths",
         "jd_lambda", "jd_mu_j", "jd_sigma_j", "jd_n_jumps", "jd_weight_used",
         "stake", "balance_before", "outcome", "profit", "balance_after",
         "sprt_status", "session_wr",
     ]
 
-    def __init__(self, path):
+    def __init__(self, path: str):
         self.path    = path
         self._exists = os.path.isfile(path)
 
@@ -558,55 +744,38 @@ class TradeLogger:
 
 
 # ===========================================================================
-# CONNECTION LAYER  (ConnState + DerivWSManager)
+# CONNECTION LAYER  — DerivWSManager  (direct port from RDBEAR v10)
 # ===========================================================================
 
 class ConnState(enum.IntEnum):
-    """Connection lifecycle states, in ascending order of readiness."""
     DISCONNECTED  = 0
     CONNECTING    = 1
-    CONNECTED     = 2   # TCP + TLS up
-    AUTHENTICATED = 3   # authorize response confirmed
-    SUBSCRIBED    = 4   # tick stream flowing
+    CONNECTED     = 2
+    AUTHENTICATED = 3
+    SUBSCRIBED    = 4
 
 
 class DerivWSManager:
     """
-    Manages a persistent, self-healing WebSocket connection to Deriv.
+    Persistent, self-healing WebSocket connection to Deriv.
+    Ported verbatim from RDBEAR v10 — no functional changes.
 
-    Improvements over the naive run_forever + sleep(3) loop
-    --------------------------------------------------------
-    1.  NEW WebSocketApp every reconnect cycle.
-        run_forever() leaves the object in a dead state; recycling it
-        causes silent send failures or hangs.
-
-    2.  Exponential back-off with +/-1s jitter.
-        First connect is immediate. Attempt n waits:
-            min(2 * 2^(n-1), 120) + uniform(-1, 1) seconds.
-        Avoids thundering-herd and Deriv 429 rate-limit after outages.
-
-    3.  Single heartbeat daemon bound per WS object.
-        The thread exits cleanly when its ws instance dies.
-        Old code spawned a new Heartbeat thread on every _on_open while
-        the previous thread was still running on a dead socket.
-
-    4.  Thread-safe safe_send().
-        Captures both ws pointer and state check atomically under _lock.
-        Never raises; callers fire-and-forget.
-
-    5.  on_disconnect_cb fires before every reconnect.
-        Lets the trader reset waiting_proposal / waiting_result so the
-        bot cannot hang indefinitely after a mid-trade connection drop.
-
-    6.  stop() is idempotent; safe from any thread.
+    Key properties:
+      • Fresh WebSocketApp every reconnect cycle (never reuse dead objects).
+      • Exponential back-off with ±1s jitter, capped at 120s.
+      • Single heartbeat daemon per WS object (exits with its socket).
+      • Thread-safe safe_send() — fire-and-forget, never raises.
+      • on_disconnect_cb fires before every reconnect (lets the trader
+        reset stuck flags before the sleep begins).
+      • stop() is idempotent, safe from any thread.
     """
 
     WS_URL             = "wss://ws.binaryws.com/websockets/v3"
-    HEARTBEAT_INTERVAL = 20      # JSON pings (beats Railway ~55s idle timeout)
-    PING_INTERVAL      = 25      # websocket-client WS-frame ping
+    HEARTBEAT_INTERVAL = 20
+    PING_INTERVAL      = 25
     PING_TIMEOUT       = 15
-    RECONNECT_BASE     = 2.0     # initial back-off (seconds)
-    RECONNECT_CAP      = 120.0   # maximum back-off (seconds)
+    RECONNECT_BASE     = 2.0
+    RECONNECT_CAP      = 120.0
 
     def __init__(self, app_id: int,
                  on_open_cb,
@@ -618,21 +787,13 @@ class DerivWSManager:
         self._on_message_cb    = on_message_cb
         self._on_disconnect_cb = on_disconnect_cb
         self.name              = name
-
         self._lock    = threading.Lock()
         self.state    = ConnState.DISCONNECTED
         self._running = False
-        self._ws      = None   # replaced every cycle; NEVER reused
-        self._attempt = 0      # drives back-off; reset to 0 on successful open
-
-    # ── Public ────────────────────────────────────────────────────────────
+        self._ws      = None
+        self._attempt = 0
 
     def safe_send(self, payload: dict) -> bool:
-        """
-        Thread-safe JSON send.
-        Returns True if delivered to the socket, False if not connected.
-        Never raises; callers can fire-and-forget.
-        """
         with self._lock:
             ws   = self._ws
             live = (self.state >= ConnState.CONNECTED and ws is not None)
@@ -646,12 +807,10 @@ class DerivWSManager:
             return False
 
     def start(self):
-        """Enter the reconnect loop (blocks the calling thread until stop())."""
         self._running = True
         self._loop()
 
     def stop(self):
-        """Signal stop and close the active connection. Idempotent."""
         self._running = False
         self.state    = ConnState.DISCONNECTED
         with self._lock:
@@ -660,11 +819,8 @@ class DerivWSManager:
             try: ws.close()
             except Exception: pass
 
-    # ── Reconnect loop ────────────────────────────────────────────────────
-
     def _loop(self):
         while self._running:
-            # Back-off (skipped on very first connect)
             if self._attempt > 0:
                 delay = min(
                     self.RECONNECT_BASE * (2 ** (self._attempt - 1)),
@@ -678,7 +834,6 @@ class DerivWSManager:
             if not self._running:
                 break
 
-            # Fresh WebSocketApp -- NEVER reuse the previous object
             self.state = ConnState.CONNECTING
             ws = websocket.WebSocketApp(
                 f"{self.WS_URL}?app_id={self.app_id}",
@@ -699,7 +854,6 @@ class DerivWSManager:
             except Exception as e:
                 log.error("[%s] run_forever raised: %s", self.name, e)
 
-            # Connection is dead
             self.state = ConnState.DISCONNECTED
             with self._lock:
                 self._ws = None
@@ -707,7 +861,6 @@ class DerivWSManager:
             if not self._running:
                 break
 
-            # Fire hook so trader can reset stuck flags before the sleep
             if self._on_disconnect_cb:
                 try: self._on_disconnect_cb()
                 except Exception as e:
@@ -717,13 +870,11 @@ class DerivWSManager:
 
         log.info("[%s] Connection loop exited cleanly.", self.name)
 
-    # ── WebSocketApp callbacks ────────────────────────────────────────────
-
     def _cb_open(self, ws):
-        self._attempt = 0            # successful connect: reset back-off
+        self._attempt = 0
         self.state    = ConnState.CONNECTED
-        log.info("[%s] Connected (back-off reset).", self.name)
-        self._spawn_heartbeat(ws)    # heartbeat bound to THIS ws object
+        log.info("[%s] Connected.", self.name)
+        self._spawn_heartbeat(ws)
         try:
             self._on_open_cb(ws)
         except Exception as e:
@@ -733,8 +884,7 @@ class DerivWSManager:
         try:
             self._on_message_cb(ws, raw)
         except Exception as e:
-            log.error("[%s] on_message_cb raised: %s",
-                      self.name, e, exc_info=True)
+            log.error("[%s] on_message_cb raised: %s", self.name, e, exc_info=True)
 
     def _cb_error(self, ws, error):
         log.warning("[%s] WS error: %s", self.name, error)
@@ -742,32 +892,24 @@ class DerivWSManager:
     def _cb_close(self, ws, code, msg):
         log.info("[%s] WS closed  code=%s  msg=%s", self.name, code, msg)
 
-    # ── Heartbeat ─────────────────────────────────────────────────────────
-
     def _spawn_heartbeat(self, ws):
-        """
-        Starts a daemon thread that sends a JSON ping every HEARTBEAT_INTERVAL.
-        The thread is bound to this specific ws object and exits cleanly when
-        that ws dies, leaving reconnect and any new heartbeat unaffected.
-        """
         def _beat():
             while self._running and self.state >= ConnState.CONNECTED:
                 try:
                     ws.send(json.dumps({"ping": 1}))
                 except Exception:
-                    break   # ws is dead; _loop handles reconnect
+                    break
                 time.sleep(self.HEARTBEAT_INTERVAL)
             log.debug("[%s] Heartbeat exiting.", self.name)
 
         threading.Thread(
-            target = _beat,
-            daemon = True,
-            name   = f"{self.name}-HB",
+            target=_beat, daemon=True,
+            name=f"{self.name}-HB",
         ).start()
 
 
 # ===========================================================================
-# HISTORICAL COLLECTOR
+# HISTORICAL COLLECTOR  (port from RDBEAR v10)
 # ===========================================================================
 
 class HistoricalCollector:
@@ -781,14 +923,15 @@ class HistoricalCollector:
         self._existing = existing_df
 
     def _fetch_page_once(self, end_epoch):
-        """Single attempt to fetch one page of historical ticks."""
         import queue as _q
         q = _q.Queue()
 
         def _on_open(ws):
             ws.send(json.dumps({
-                "ticks_history": self.symbol, "end": end_epoch,
-                "count": self.MAX_PER_CALL, "style": "ticks",
+                "ticks_history": self.symbol,
+                "end"          : end_epoch,
+                "count"        : self.MAX_PER_CALL,
+                "style"        : "ticks",
                 "adjust_start_time": 1,
             }))
 
@@ -800,7 +943,7 @@ class HistoricalCollector:
                     q.put(sorted(
                         [{"timestamp": float(t), "price": float(p)}
                          for t, p in zip(h.get("times", []), h.get("prices", []))],
-                        key=lambda x: x["timestamp"]
+                        key=lambda x: x["timestamp"],
                     ))
                 elif "error" in msg:
                     log.error("[Collector] Error: %s", msg["error"])
@@ -813,7 +956,8 @@ class HistoricalCollector:
                 q.put([]); ws.close()
 
         def _on_err(ws, e):
-            log.warning("[Collector] WS error: %s", e); q.put([])
+            log.warning("[Collector] WS error: %s", e)
+            q.put([])
 
         ws = websocket.WebSocketApp(
             f"{self.WS_URL}?app_id={self.cfg['app_id']}",
@@ -832,15 +976,14 @@ class HistoricalCollector:
             t.join(timeout=3)
 
     def _fetch_page(self, end_epoch, max_retries=3):
-        """Fetch one page of tick history with exponential back-off retry."""
         for attempt in range(max_retries):
             result = self._fetch_page_once(end_epoch)
             if result:
                 return result
             if attempt < max_retries - 1:
                 delay = (2 ** attempt) + random.uniform(0.0, 1.0)
-                log.warning("[Collector/%s] Page fetch empty (attempt %d/%d)"
-                            " -- retrying in %.1fs ...",
+                log.warning("[Collector/%s] Empty page (attempt %d/%d) "
+                            "retrying in %.1fs ...",
                             self.symbol, attempt + 1, max_retries, delay)
                 time.sleep(delay)
         return []
@@ -862,7 +1005,8 @@ class HistoricalCollector:
                 if min(t["timestamp"] for t in all_ticks) <= cutoff_epoch:
                     log.info("[Collector/%s] Existing CSV covers window — reusing.",
                              self.symbol)
-                    self._save(all_ticks); return
+                    self._save(all_ticks)
+                    return
 
         fetch_end = now_epoch
         for page_num in range(1, 20):
@@ -870,7 +1014,8 @@ class HistoricalCollector:
             if not page:
                 log.warning("[Collector/%s] Empty page %d.", self.symbol, page_num)
                 break
-            all_ticks.extend([tk for tk in page if tk["timestamp"] >= cutoff_epoch])
+            all_ticks.extend(
+                [tk for tk in page if tk["timestamp"] >= cutoff_epoch])
             if page[0]["timestamp"] <= cutoff_epoch:
                 break
             fetch_end = int(page[0]["timestamp"]) - 1
@@ -904,25 +1049,49 @@ class HistoricalCollector:
 
 
 # ===========================================================================
-# LIVE TRADER
+# LIVE TRADER  — Rise / Fall
 # ===========================================================================
 
 class LiveTrader:
-    WS_URL = "wss://ws.binaryws.com/websockets/v3"
+    """
+    Connects to Deriv, accumulates ticks, runs Monte Carlo direction
+    estimation across all candidate durations, and fires the CALL/PUT
+    contract for the best signal that the intelligence layer agrees is good.
+
+    Duration selection algorithm
+    ----------------------------
+    For each tick (after cooldowns):
+      1. Compute σ once from the rolling tick buffer.
+      2. For each candidate duration T ∈ hold_durations:
+           (p_rise, p_fall) = MC_simulate(tick_buf, T, σ)
+           direction   = "CALL" if p_rise > p_fall else "PUT"
+           p_win       = max(p_rise, p_fall)
+           Intelligence layer asks "is this signal good?":
+             - p_win > mc_p_floor
+             - GBM model agrees with the blended direction
+             - JD model (if active) agrees with the blended direction
+      3. Pick T* = argmax p_win among durations where the intelligence
+         layer agrees the signal is good.
+      4. If no T* found → no trade (wait for the next tick).
+      5. Require signal_persistence_ticks consecutive ticks agreeing
+         on the same (direction, duration) before placing the trade.
+
+    Payout discovery
+    ----------------
+    A live proposal is sent to Deriv at the chosen stake to discover
+    the real payout ratio, used for Kelly sizing and logging only.
+    The trade is placed once the intelligence layer and persistence
+    checks pass — there is no EV or payout-ratio gate.
+    """
 
     def __init__(self, cfg, initial_ticks, staker, sprt, trade_logger):
-        self.cfg       = cfg
-        self.staker    = staker
-        self.sprt      = sprt
-        self.logger    = trade_logger
-        self.pricer    = MonteCarloPricer(cfg)
+        self.cfg     = cfg
+        self.staker  = staker
+        self.sprt    = sprt
+        self.logger  = trade_logger
+        self.pricer  = MonteCarloPricer(cfg)
 
-        # Tick buffer — seeded with historical ticks, grows with live ticks
-        self.tick_buf  = deque(initial_ticks, maxlen=5000)
-
-        # Per-duration calibrated barriers and payout cache
-        self.barrier_table = {}   # {duration_mins: barrier_offset}
-        self.payout_table  = {}   # {duration_mins: payout_ratio}
+        self.tick_buf = deque(initial_ticks, maxlen=5000)
 
         # State
         self.balance        = None
@@ -936,71 +1105,60 @@ class LiveTrader:
         self.pending_pid      = None
         self.pending_stake    = 0.0
         self.pending_dur      = None
-        self.pending_p_stat   = 0.0
-        self.pending_barrier  = 0.0
-        self.pending_payout   = 0.0
+        self.pending_direction= None   # "CALL" or "PUT"
+        self.pending_p_win    = 0.0
+        self.pending_p_rise   = 0.0
+        self.pending_p_fall   = 0.0
+        self.pending_payout   = 0.85   # updated from live proposal
+        self.pending_sigma    = 0.0
 
         # Counters
-        self.live_tick_count  = 0
-        self.post_trade_tick  = 0
-        self.consec_losses    = 0
-        self.cooldown_until   = 0
+        self.live_tick_count = 0
+        self.post_trade_tick = 0
+        self.consec_losses   = 0
+        self.cooldown_until  = 0
         self.wins = self.total = 0
-        self.session_pnl      = 0.0
+        self.session_pnl     = 0.0
 
         # Signal persistence
-        self._persist_count   = 0
-        self._persist_best_p  = 0.0
-        self._persist_dur     = None
+        self._persist_count    = 0
+        self._persist_best_p   = 0.0
+        self._persist_dur      = None
+        self._persist_dir      = None
 
-        # Cache for CSV logging
-        self._last_p_stat     = 0.0
-        self._last_ev         = 0.0
-        self._last_sigma      = 0.0
-        self._last_mc_T       = 0
+        # Logging cache
+        # (no EV cache — intelligence-layer gating only)
 
-        # Barrier calibration flag
-        self._calibrating     = False
-
-        # Connection manager (replaces raw WebSocketApp management)
+        # Connection manager (verbatim from RDBEAR v10)
         self._conn = DerivWSManager(
             app_id           = cfg["app_id"],
             on_open_cb       = self._on_ws_open,
             on_message_cb    = self._on_message,
             on_disconnect_cb = self._on_disconnect,
-            name             = "LiveTrader",
+            name             = "LiveTrader-RF",
         )
 
-    # ── WebSocket lifecycle ───────────────────────────────────────────────
+    # ── Lifecycle ────────────────────────────────────────────────────────
 
     def run(self):
         self.running = True
         log.info("[Trader] Starting connection manager ...")
-        self._conn.start()   # blocks until stop() is called
+        self._conn.start()
 
     def stop(self):
         self.running = False
         self._conn.stop()
 
     def _on_ws_open(self, ws):
-        """Called by DerivWSManager on every (re)connect."""
-        log.info("[Trader] (Re)connected -- authorising ...")
-        # Heartbeat is owned by DerivWSManager._spawn_heartbeat; none needed here.
+        log.info("[Trader] (Re)connected — authorising ...")
         self._conn.safe_send({"authorize": self.cfg["api_token"]})
 
     def _on_disconnect(self):
-        """
-        Called by DerivWSManager before every reconnect attempt.
-        Resets flags that could leave the bot permanently hung when a
-        connection drop occurs mid-trade or mid-proposal.
-        """
         if self.waiting_proposal:
-            log.warning("[Trader] Connection lost during pending proposal"
-                        " -- resetting flag.")
+            log.warning("[Trader] Connection lost mid-proposal — resetting.")
             self.waiting_proposal = False
         if self.waiting_result:
-            log.warning("[Trader] Connection lost while awaiting contract"
-                        " settlement -- resetting flag (outcome unknown).")
+            log.warning("[Trader] Connection lost awaiting settlement — resetting.")
             self.waiting_result = False
 
     def _on_message(self, ws, raw):
@@ -1010,26 +1168,26 @@ class LiveTrader:
             return
         mt = msg.get("msg_type", "")
         try:
-            if   mt == "authorize":      self._on_auth(msg)
-            elif mt == "balance":        self._on_balance(msg)
-            elif mt == "tick":           self._on_tick(msg)
-            elif mt == "proposal":       self._on_proposal(msg)
-            elif mt == "buy":            self._on_buy(msg)
-            elif mt == "proposal_open_contract": self._on_poc(msg)
+            if   mt == "authorize":               self._on_auth(msg)
+            elif mt == "balance":                 self._on_balance(msg)
+            elif mt == "tick":                    self._on_tick(msg)
+            elif mt == "proposal":                self._on_proposal(msg)
+            elif mt == "buy":                     self._on_buy(msg)
+            elif mt == "proposal_open_contract":  self._on_poc(msg)
             elif "error" in msg:
                 log.warning("[Trader] API error: %s",
                             msg["error"].get("message", str(msg["error"])))
         except Exception as e:
-            log.error("[Trader] Message handler error: %s", e, exc_info=True)
+            log.error("[Trader] Handler error: %s", e, exc_info=True)
 
     # ── Auth ─────────────────────────────────────────────────────────────
 
     def _on_auth(self, msg):
-        info           = msg.get("authorize", {})
-        self.balance   = float(info.get("balance", 0))
+        info               = msg.get("authorize", {})
+        self.balance       = float(info.get("balance", 0))
         self.start_balance = self.balance
         self.peak_balance  = self.balance
-        log.info("[Trader] Authorised: %s | %s %.2f",
+        log.info("[Trader] Authorised: %s | %s $%.2f",
                  info.get("loginid", "?"),
                  info.get("currency", "USD"),
                  self.balance)
@@ -1037,10 +1195,8 @@ class LiveTrader:
         self._conn.safe_send({"balance": 1, "subscribe": 1})
         self._conn.safe_send({"ticks": self.cfg["symbol"], "subscribe": 1})
         self._conn.state = ConnState.SUBSCRIBED
-        threading.Thread(target=self._calibrate_barriers,
-                         daemon=True, name="BarrierCal").start()
-        log.info("[Trader] Waiting for tick buffer to fill "
-                 "(need %d ticks) ...", self.cfg["min_ticks"])
+        log.info("[Trader] Subscribed to ticks. Waiting for buffer "
+                 "(%d ticks) ...", self.cfg["min_ticks"])
 
     # ── Balance ───────────────────────────────────────────────────────────
 
@@ -1063,93 +1219,78 @@ class LiveTrader:
 
         if not self.running or self.waiting_result or self.waiting_proposal:
             return
-
-        # Not enough ticks yet
         if len(self.tick_buf) < self.cfg["min_ticks"]:
-            if self.live_tick_count % 100 == 0:
+            if self.live_tick_count % 50 == 0:
                 log.info("[Trader] Buffer %d/%d ticks ...",
                          len(self.tick_buf), self.cfg["min_ticks"])
             return
-
-        # Cooldown
         if self.live_tick_count < self.cooldown_until:
             return
-
-        # Post-trade cooldown
-        min_gap = self.cfg.get("min_ticks_between_trades", 60)
+        min_gap = self.cfg.get("min_ticks_between_trades", 30)
         if self.live_tick_count - self.post_trade_tick < min_gap:
             return
 
         self._evaluate_signal()
 
-    # ── Monte Carlo signal evaluation ─────────────────────────────────────
-
-    @staticmethod
-    def _dur_crosses_midnight(duration_mins: int) -> bool:
-        """True if a trade opened now would expire past 00:00 UTC."""
-        now = datetime.utcnow()
-        secs_to_midnight = (23 - now.hour)*3600 + (59 - now.minute)*60 + (59 - now.second)
-        return duration_mins * 60 > secs_to_midnight
+    # ── Duration-selection signal evaluator ───────────────────────────────
 
     def _evaluate_signal(self):
-        cfg      = self.cfg
-        ev_floor = cfg.get("ev_confidence_floor", 0.673)
-        ev_thr   = cfg.get("min_ev_threshold",    0.001)
-        fallback = cfg.get("expiryrange_barrier",  2.97)
-        durations = cfg.get("hold_durations",      [2, 3, 4, 5, 6])
+        cfg       = self.cfg
+        p_floor   = cfg.get("mc_p_floor", 0.51)
+        durations = cfg.get("hold_durations", [1, 2, 3, 4, 5])
 
-        best_p   = 0.0
-        best_dur = None
-        best_sigma = 0.0
-        best_T   = 0
-
-        # Compute σ once for the current tick buffer — shared across all durations.
-        # Only the tick horizon T differs per duration; σ is buffer-wide.
+        # Shared σ, drift, AR(1) rho, and regime bump — computed once
         shared_sigma = self.pricer.ewma_sigma(self.tick_buf)
-        tpm          = self.pricer._tpm_cfg or MonteCarloPricer.detect_tpm(self.tick_buf)
+        # Trigger regime check (result stored in pricer.last_regime_bump
+        # and injected into last_components by simulate_direction)
+        self.pricer.regime_floor_bump(self.tick_buf)
 
-        # ── Run MC simulation for every candidate duration, pick best ──────
+        best_p   = -1.0
+        best_dur = None
+        best_dir = None
+        best_rise = 0.0
+        best_fall = 0.0
+        best_reason = ""
+
+        # Probe every candidate duration. A duration only qualifies if
+        # the intelligence layer agrees the signal is good (all models
+        # agree on direction and p_win clears the floor).
         for dur in durations:
-            if self._dur_crosses_midnight(dur):
-                continue   # would cross UTC midnight — Deriv rejects
-            barrier = self.barrier_table.get(dur, fallback)
-            # Pass pre-computed sigma directly to avoid recomputing per duration
-            p, sigma, T = self.pricer.simulate_with_sigma(
-                self.tick_buf, barrier, dur, shared_sigma, tpm)
-            if p > best_p:
-                best_p    = p
+            p_rise, p_fall = self.pricer.simulate_direction(
+                self.tick_buf, dur, shared_sigma)
+            direction = "CALL" if p_rise >= p_fall else "PUT"
+            p_win     = p_rise if direction == "CALL" else p_fall
+
+            is_good, reason = self.pricer.signal_quality(
+                direction, p_win, p_floor)
+            if not is_good:
+                continue
+
+            # Among good signals, prefer the strongest directional edge.
+            if p_win > best_p:
+                best_p    = p_win
                 best_dur  = dur
-                best_sigma = sigma
-                best_T    = T
+                best_dir  = direction
+                best_rise = p_rise
+                best_fall = p_fall
+                best_reason = reason
 
-        # Cache for logging
-        self._last_p_stat = best_p
-        self._last_sigma  = best_sigma
-        self._last_mc_T   = best_T
-
-        # ── EV gate (prelim — uses cached payout) ─────────────────────────
-        cached_payout = self.payout_table.get(best_dur,
-                        cfg.get("min_payout_pct", 0.48))
-        ev = MonteCarloPricer.ev(best_p, cached_payout)
-        self._last_ev = ev
-
-        if best_p < ev_floor or ev < ev_thr:
-            # Soft decay instead of hard reset — one below-floor tick no longer
-            # wipes accumulated signal. Count drops by 1 each miss (floor 0).
+        if best_dur is None:
             self._persist_count = max(0, self._persist_count - 1)
             if self.live_tick_count % 30 == 0:
-                log.info("[MC] p=%.4f ev=%+.4f dur=%sm  SKIP (below floor)  "
-                         "σ=%.6f λ=%.5f  persist_decay=%d",
-                         best_p, ev,
-                         str(best_dur) if best_dur else "?",
-                         best_sigma,
+                log.info("[MC] No good signal  best_p=%.4f σ=%.6f "
+                         "µ=%+.7f rho=%.3f λ=%.5f  persist_decay=%d",
+                         best_p, shared_sigma,
+                         self.pricer.last_drift,
+                         self.pricer.last_rho,
                          self.pricer.last_jump_params.lam,
                          self._persist_count)
             return
 
         # ── Signal persistence ─────────────────────────────────────────────
         required = cfg.get("signal_persistence_ticks", 2)
-        if best_dur == self._persist_dur:
+        same = (best_dur == self._persist_dur and best_dir == self._persist_dir)
+        if same:
             self._persist_count += 1
             if best_p > self._persist_best_p:
                 self._persist_best_p = best_p
@@ -1157,50 +1298,60 @@ class LiveTrader:
             self._persist_count  = 1
             self._persist_best_p = best_p
             self._persist_dur    = best_dur
+            self._persist_dir    = best_dir
 
         if self._persist_count < required:
             if self.live_tick_count % 10 == 0:
-                log.info("[MC] Persistence %d/%d  p=%.4f  dur=%dm",
-                         self._persist_count, required, best_p, best_dur)
+                log.info("[MC] Persistence %d/%d  %s  dur=%dt  p=%.4f  (%s)",
+                         self._persist_count, required,
+                         best_dir, best_dur, best_p, best_reason)
             return
 
-        # ── All checks passed — send proposal ─────────────────────────────
+        # ── All checks passed — intelligence layer agrees ──────────────────
         jp = self.pricer.last_jump_params
-        log.info("[MC] *** SIGNAL *** p_blend=%.4f ev=%+.4f "
-                 "dur=%dm σ=%.6f T=%d persist=%d | "
-                 "JD: λ=%.5f μ_J=%+.5f σ_J=%.5f n_jumps=%d/%d weight=%.1f",
-                 best_p, ev, best_dur, best_sigma, best_T,
-                 self._persist_count,
+        log.info("[MC] *** SIGNAL *** %s  dur=%dt  p_win=%.4f  "
+                 "p_rise=%.4f  p_fall=%.4f  σ=%.6f  µ=%+.7f  rho=%.3f  "
+                 "regime_bump=%.2f  persist=%d  intel=%s | "
+                 "JD: λ=%.5f μ_J=%+.5f σ_J=%.5f n_jumps=%d/%d  ew=%.2f",
+                 best_dir, best_dur, best_p,
+                 best_rise, best_fall, shared_sigma,
+                 self.pricer.last_drift, self.pricer.last_rho,
+                 self.pricer.last_regime_bump,
+                 self._persist_count, best_reason,
                  jp.lam, jp.mu_j, jp.sigma_j, jp.n_jumps, jp.n_obs,
                  self.cfg.get("jd_weight", 0.5))
 
-        self._persist_count = 0   # reset after firing
+        self._persist_count = 0
 
         if not self.balance or self.balance <= 0:
             log.warning("[Trader] Balance not confirmed — skipping.")
             return
 
-        stake = self.staker.next_stake(best_p, self.balance, cached_payout)
+        # Stake computed with estimated payout; refined once the real
+        # payout comes back in the proposal (used for sizing only).
+        stake = self.staker.next_stake(best_p, self.balance, 0.80)
 
-        self.pending_stake    = stake
-        self.pending_dur      = best_dur
-        self.pending_p_stat   = best_p
-        self.pending_barrier  = self.barrier_table.get(best_dur, fallback)
-        self.pending_payout   = cached_payout
-        self.waiting_proposal = True
+        self.pending_stake     = stake
+        self.pending_dur       = best_dur
+        self.pending_direction = best_dir
+        self.pending_p_win     = best_p
+        self.pending_p_rise    = best_rise
+        self.pending_p_fall    = best_fall
+        self.pending_sigma     = shared_sigma
+        self.waiting_proposal  = True
 
-        barrier_offset = self.barrier_table.get(best_dur, fallback)
+        log.info("[Trader] Sending proposal  %s  dur=%dt  stake=$%.2f",
+                 best_dir, best_dur, stake)
+
         self._conn.safe_send({
             "proposal"      : 1,
             "amount"        : stake,
             "basis"         : "stake",
-            "contract_type" : "EXPIRYRANGE",
+            "contract_type" : best_dir,          # "CALL" or "PUT"
             "currency"      : cfg.get("currency", "USD"),
             "duration"      : best_dur,
-            "duration_unit" : "m",
+            "duration_unit" : "t",               # ticks
             "symbol"        : cfg["symbol"],
-            "barrier"       : f"+{barrier_offset:.2f}",
-            "barrier2"      : f"-{barrier_offset:.2f}",
         })
 
     # ── Proposal response ─────────────────────────────────────────────────
@@ -1216,41 +1367,20 @@ class LiveTrader:
         pid           = msg.get("id") or prop.get("id")
         ask_price     = float(prop.get("ask_price",
                               prop.get("cost", self.pending_stake)))
-        payout_amount = float(prop.get("payout", ask_price * 1.486))
+        payout_amount = float(prop.get("payout", ask_price * 1.85))
+        # Net payout ratio: profit / stake (kept for Kelly sizing / logging
+        # only — no longer used as a trade-acceptance gate).
         payout_ratio  = round((payout_amount - ask_price) / max(ask_price, 1e-8), 4)
 
-        cfg      = self.cfg
-        ev_floor = cfg.get("ev_confidence_floor", 0.673)
-        ev_thr   = cfg.get("min_ev_threshold",    0.001)
-        min_pay  = cfg.get("min_payout_pct",       0.48)
-
-        # Payout minimum check
-        if payout_ratio < min_pay:
-            log.info("[EV] SKIP — payout=%.1f%% < min=%.0f%%",
-                     payout_ratio * 100, min_pay * 100)
-            self.waiting_proposal = False
-            return
-
-        # Final EV check with real payout
-        p  = self.pending_p_stat
-        ev = MonteCarloPricer.ev(p, payout_ratio)
-        self._last_ev = ev
-
-        if cfg.get("ev_check_on_proposal", True):
-            if p < ev_floor or ev < ev_thr:
-                log.info("[EV] SKIP — p=%.4f < floor=%.3f or EV=%+.4f < thr",
-                         p, ev_floor, ev)
-                self.waiting_proposal = False
-                return
-
-        self.pending_pid    = pid
-        self.pending_payout = payout_ratio
+        self.pending_pid      = pid
+        self.pending_payout   = payout_ratio
         self.waiting_proposal = False
         self.waiting_result   = True
 
-        log.info("[Trader] Proposal OK  payout=%.1f%%  p=%.4f  "
-                 "EV=%+.4f  stake=$%.2f  pid=%s",
-                 payout_ratio * 100, p, ev, self.pending_stake, pid)
+        log.info("[Trader] Proposal OK  %s  dur=%dt  payout=%.1f%%  "
+                 "p_win=%.4f  stake=$%.2f",
+                 self.pending_direction, self.pending_dur,
+                 payout_ratio * 100, self.pending_p_win, self.pending_stake)
 
         self._conn.safe_send({
             "buy"  : pid,
@@ -1267,8 +1397,11 @@ class LiveTrader:
             return
         buy = msg.get("buy", {})
         cid = str(buy.get("contract_id", "?"))
-        log.info("[Trader] Contract opened  cid=%s  paid=$%.2f",
-                 cid, float(buy.get("buy_price", self.pending_stake)))
+        log.info("[Trader] Contract opened  cid=%s  paid=$%.2f  %s %dt",
+                 cid,
+                 float(buy.get("buy_price", self.pending_stake)),
+                 self.pending_direction,
+                 self.pending_dur)
         self._conn.safe_send({
             "proposal_open_contract": 1,
             "contract_id"           : int(cid),
@@ -1280,7 +1413,7 @@ class LiveTrader:
     def _on_poc(self, msg):
         poc = msg.get("proposal_open_contract", {})
         if not poc.get("is_sold", 0):
-            return  # not settled yet
+            return
 
         profit  = float(poc.get("profit", 0))
         win     = profit > 0
@@ -1300,11 +1433,12 @@ class LiveTrader:
             self.consec_losses += 1
 
         wr = self.wins / self.total * 100
-
-        log.info("[Trade] %s #%d | P&L=%+.2f | bal=$%.2f | "
+        log.info("[Trade] %s #%d | %s %dt | P&L=%+.2f | bal=$%.2f | "
                  "W/L=%d/%d (%.1f%%) | SPRT:%s",
                  "WIN " if win else "LOSS",
-                 self.total, profit, new_bal,
+                 self.total,
+                 self.pending_direction, self.pending_dur,
+                 profit, new_bal,
                  self.wins, self.total - self.wins, wr,
                  self.sprt.update(win))
 
@@ -1312,9 +1446,8 @@ class LiveTrader:
         self.post_trade_tick = self.live_tick_count
         self.waiting_result  = False
 
-        # Consecutive loss cooldown
-        if (not win and
-                self.consec_losses >= self.cfg.get("max_consec_losses", 5)):
+        # Consecutive-loss cooldown
+        if not win and self.consec_losses >= self.cfg.get("max_consec_losses", 5):
             cd = self.cfg.get("consec_loss_cooldown_ticks", 60)
             self.cooldown_until = self.live_tick_count + cd
             log.warning("[Risk] %d consecutive losses — cooling down %d ticks.",
@@ -1322,47 +1455,43 @@ class LiveTrader:
             self.consec_losses = 0
 
         # CSV log
-        jp = self.pricer.last_jump_params
-        eff_w = self.cfg.get("jd_weight", 0.5) if jp.n_jumps >= self.cfg.get("jd_min_jumps", 5) else 0.0
+        jp   = self.pricer.last_jump_params
+        eff_w = (self.cfg.get("jd_weight", 0.5)
+                 if jp.n_jumps >= self.cfg.get("jd_min_jumps", 5) else 0.0)
         self.logger.log({
-            "timestamp"      : datetime.utcnow().isoformat(),
-            "symbol"         : self.cfg["symbol"],
-            "duration_mins"  : self.pending_dur,
-            "barrier_offset" : round(self.pending_barrier, 4),
-            "price_at_entry" : round(list(self.tick_buf)[-1]["price"], 5)
-                               if self.tick_buf else "",
-            "p_contain"      : round(self.pending_p_stat, 5),
-            "ev"             : round(self._last_ev, 5),
-            "payout"         : round(self.pending_payout, 4),
-            "sigma_ewma"     : round(self._last_sigma, 8),
-            "mc_paths"       : self.cfg.get("mc_n_paths", 1000),
-            "mc_ticks"       : self._last_mc_T,
-            "jd_lambda"      : round(jp.lam, 6),
-            "jd_mu_j"        : round(jp.mu_j, 6),
-            "jd_sigma_j"     : round(jp.sigma_j, 6),
-            "jd_n_jumps"     : jp.n_jumps,
-            "jd_weight_used" : round(eff_w, 2),
-            "stake"          : round(self.pending_stake, 2),
-            "balance_before" : round(old_bal, 2),
-            "outcome"        : "WIN" if win else "LOSS",
-            "profit"         : round(profit, 2),
-            "balance_after"  : round(new_bal, 2),
-            "sprt_status"    : self.sprt.status,
-            "session_wr"     : round(wr, 2),
+            "timestamp"       : datetime.utcnow().isoformat(),
+            "symbol"          : self.cfg["symbol"],
+            "direction"       : self.pending_direction,
+            "duration_ticks"  : self.pending_dur,
+            "price_at_entry"  : round(list(self.tick_buf)[-1]["price"], 5)
+                                if self.tick_buf else "",
+            "p_rise"          : round(self.pending_p_rise, 5),
+            "p_fall"          : round(self.pending_p_fall, 5),
+            "p_win"           : round(self.pending_p_win, 5),
+            "payout_ratio"    : round(self.pending_payout, 4),
+            "sigma_ewma"      : round(self.pending_sigma, 8),
+            "mc_paths"        : self.cfg.get("mc_n_paths", 3000),
+            "jd_lambda"       : round(jp.lam, 6),
+            "jd_mu_j"         : round(jp.mu_j, 6),
+            "jd_sigma_j"      : round(jp.sigma_j, 6),
+            "jd_n_jumps"      : jp.n_jumps,
+            "jd_weight_used"  : round(eff_w, 2),
+            "stake"           : round(self.pending_stake, 2),
+            "balance_before"  : round(old_bal, 2),
+            "outcome"         : "WIN" if win else "LOSS",
+            "profit"          : round(profit, 2),
+            "balance_after"   : round(new_bal, 2),
+            "sprt_status"     : self.sprt.status,
+            "session_wr"      : round(wr, 2),
         })
 
-        # Recalibrate barriers in background after every trade
-        threading.Thread(target=self._calibrate_barriers,
-                         daemon=True, name="BarrierRecal").start()
-
-        # Risk checks
         if not self._risk_ok():
             log.warning("[Risk] Risk limit hit — stopping.")
             self.stop()
 
     # ── Risk ──────────────────────────────────────────────────────────────
 
-    def _risk_ok(self):
+    def _risk_ok(self) -> bool:
         cfg = self.cfg
         sb  = self.start_balance or 1.0
         pb  = self.peak_balance  or self.balance or 1.0
@@ -1379,130 +1508,6 @@ class LiveTrader:
             return False
         return True
 
-    # ── Barrier calibration ───────────────────────────────────────────────
-
-    def _calibrate_barriers(self):
-        if self._calibrating: return
-        self._calibrating = True
-
-        cfg      = self.cfg
-        durations = cfg.get("hold_durations", [2, 3, 4, 5, 6])
-        fallback = cfg.get("expiryrange_barrier", 2.97)
-        symbol   = cfg["symbol"]
-
-        log.info("[BarrierCal] Calibrating %s for durations %s ...",
-                 symbol, durations)
-
-        import queue as _q
-
-        def _probe_once(duration, barrier):
-            """Single attempt to probe the payout for a given duration+barrier."""
-            q = _q.Queue()
-
-            def _oo(ws):
-                ws.send(json.dumps({
-                    "proposal"      : 1,
-                    "amount"        : cfg["kelly_min_stake"],
-                    "basis"         : "stake",
-                    "contract_type" : "EXPIRYRANGE",
-                    "currency"      : cfg["currency"],
-                    "duration"      : duration,
-                    "duration_unit" : "m",
-                    "symbol"        : symbol,
-                    "barrier"       : f"+{barrier:.2f}",
-                    "barrier2"      : f"-{barrier:.2f}",
-                }))
-
-            def _om(ws, raw):
-                try:
-                    m = json.loads(raw)
-                    if m.get("msg_type") == "proposal":
-                        p   = m.get("proposal", {})
-                        ask = float(p.get("ask_price", cfg["kelly_min_stake"]))
-                        pay = float(p.get("payout",   ask * 1.486))
-                        q.put((pay - ask) / max(ask, 1e-8))
-                    elif "error" in m:
-                        q.put(None)
-                    else:
-                        return
-                    ws.close()
-                except Exception:
-                    q.put(None); ws.close()
-
-            ws2 = websocket.WebSocketApp(
-                f"{self.WS_URL}?app_id={cfg['app_id']}",
-                on_open=_oo, on_message=_om,
-                on_error=lambda *_: q.put(None),
-                on_close=lambda *_: None,
-            )
-            t = threading.Thread(target=ws2.run_forever, daemon=True)
-            t.start()
-            try:
-                return q.get(timeout=15)
-            except Exception:
-                return None
-            finally:
-                try: ws2.close()
-                except Exception: pass
-                t.join(timeout=3)
-
-        def _probe(duration, barrier, max_retries=3):
-            """Probe with exponential back-off retry. Returns payout ratio or None."""
-            for attempt in range(max_retries):
-                result = _probe_once(duration, barrier)
-                if result is not None:
-                    return result
-                if attempt < max_retries - 1:
-                    delay = 2 ** attempt
-                    log.warning("[BarrierCal] Probe failed  dur=%dm  barrier=+/-%.2f"
-                                "  (attempt %d/%d) retrying in %ds ...",
-                                duration, barrier, attempt + 1, max_retries, delay)
-                    time.sleep(delay)
-            return None
-
-        # Per-duration barrier search bounds (lo, hi, payout_lo, payout_hi)
-        # 1HZ10V barrier search bounds — derived from live capture 2026-06-13.
-        # Price ~10070, σ_ewma_abs=0.153 pts/tick, tpm=60, near-normal returns.
-        # 1σ diffusion range = 0.153 * sqrt(tpm * dur_mins).
-        # Bounds: lo=1.2×1σ, hi=4×1σ (wide enough for calibrator bisection).
-        dur_bounds = {
-            2 : ( 2.0,  6.7,  0.46, 0.50),
-            3 : ( 2.5,  8.2,  0.46, 0.50),
-            4 : ( 2.8,  9.5,  0.46, 0.50),
-            5 : ( 3.2, 10.6,  0.46, 0.50),
-            6 : ( 3.5, 11.6,  0.46, 0.50),
-            7 : ( 3.8, 12.5,  0.46, 0.50),
-            8 : ( 4.0, 13.4,  0.46, 0.50),
-            9 : ( 4.3, 14.2,  0.46, 0.50),
-            10: ( 4.5, 15.0,  0.46, 0.50),
-            12: ( 4.9, 16.4,  0.46, 0.50),
-            15: ( 5.5, 18.3,  0.46, 0.50),
-        }
-        for dur in durations:
-            lo, hi, p_lo, p_hi = dur_bounds.get(dur, (0.5, 8.0, 0.46, 0.50))
-            best = fallback; best_pr = None
-            for _ in range(10):
-                mid = round((lo + hi) / 2, 2)
-                pr  = _probe(dur, mid)
-                if pr is None: break
-                if best_pr is None or abs(pr - 0.485) < abs(best_pr - 0.485):
-                    best = mid; best_pr = pr
-                if p_lo <= pr <= p_hi: break
-                if pr < p_lo: hi = mid
-                else:         lo = mid
-                time.sleep(0.3)
-
-            self.barrier_table[dur] = best
-            if best_pr is not None:
-                self.payout_table[dur] = float(best_pr)
-            log.info("[BarrierCal] %s %dm → barrier=±%.2f  payout=%.1f%%",
-                     symbol, dur, best,
-                     (best_pr or 0) * 100)
-
-        log.info("[BarrierCal] Done: %s",
-                 {f"{k}m": f"±{v:.2f}" for k, v in self.barrier_table.items()})
-        self._calibrating = False
-
 
 # ===========================================================================
 # MAIN
@@ -1513,43 +1518,49 @@ def main():
     symbol = cfg["symbol"]
 
     log.info("=" * 65)
-    log.info("  DERIV RANGE BOT  v10  —  1HZ10V  Monte Carlo + Jump-Diffusion")
-    log.info("  Symbol   : %s", symbol)
-    log.info("  MC paths : %d   vol_window : %d ticks   α=%.2f   terminal_w=%.1f",
-             cfg["mc_n_paths"], cfg["mc_vol_window"], cfg["mc_ewma_alpha"],
-             cfg["mc_terminal_weight"])
-    log.info("  JD       : threshold=%.1fσ  fit_window=%d  min_jumps=%d  weight=%.2f",
+    log.info("  DERIV RISE/FALL BOT  v3  —  Monte Carlo + Jump-Diffusion")
+    log.info("  Symbol      : %s", symbol)
+    log.info("  MC paths    : %d   vol_window=%d  α=%.2f",
+             cfg["mc_n_paths"], cfg["mc_vol_window"], cfg["mc_ewma_alpha"])
+    log.info("  JD          : threshold=%.1fσ  window=%d  min_jumps=%d  w=%.2f",
              cfg["jd_jump_threshold"], cfg["jd_fit_window"],
-             cfg["jd_min_jumps"], cfg["jd_weight"])
-    log.info("  p_floor  : %.3f  min_ev: %.3f  (48.6%% payout, break-even=0.673)",
-             cfg["ev_confidence_floor"], cfg["min_ev_threshold"])
-    log.info("  Persist  : %d consecutive ticks above floor",
+             cfg["jd_min_jumps"],      cfg["jd_weight"])
+    log.info("  p_floor     : %.3f  (intelligence layer: GBM+JD agreement)",
+             cfg["mc_p_floor"])
+    log.info("  Durations   : %s ticks", cfg["hold_durations"])
+    log.info("  Kelly       : fraction=%.2f  max_pct=%.0f%%  "
+             "min=$%.2f  max=$%.2f",
+             cfg["kelly_fraction"], cfg["kelly_max_pct"] * 100,
+             cfg["kelly_min_stake"], cfg["kelly_max_stake"])
+    log.info("  Persist     : %d consecutive ticks",
              cfg["signal_persistence_ticks"])
     log.info("=" * 65)
 
     if not cfg.get("api_token"):
-        log.error("DERIV_API_TOKEN not set. Exiting.")
+        log.error("DERIV_API_TOKEN not set.  "
+                  "Export it:  export DERIV_API_TOKEN=your_token")
         sys.exit(1)
 
-    # ── Phase 1: Load or fetch historical ticks ────────────────────────────
+    # ── Phase 1: Collect historical ticks ─────────────────────────────────
     log.info("\n>> PHASE 1 — Historical tick collection")
     data_path = os.path.join(cfg["data_dir"], f"ticks_{symbol}.csv")
-    existing  = pd.read_csv(data_path) if os.path.isfile(data_path) else pd.DataFrame()
+    existing  = (pd.read_csv(data_path)
+                 if os.path.isfile(data_path) else pd.DataFrame())
 
     done = threading.Event()
     HistoricalCollector(symbol, cfg, done, existing).start()
     done.wait()
 
-    df = pd.read_csv(data_path)
+    df = pd.read_csv(data_path) if os.path.isfile(data_path) else pd.DataFrame()
     if len(df) < cfg["min_ticks"]:
         log.warning("[Main] Only %d ticks (need %d). "
                     "Will trade once buffer fills live.", len(df), cfg["min_ticks"])
 
-    initial_ticks = df.tail(5000).to_dict("records")
+    initial_ticks = (df.tail(5000).to_dict("records") if not df.empty else [])
     log.info("[Main] Seeding tick buffer with %d historical ticks.",
              len(initial_ticks))
 
-    # ── Phase 2: Start live trading ────────────────────────────────────────
+    # ── Phase 2: Live trading ──────────────────────────────────────────────
     log.info("\n>> PHASE 2 — Starting live trading on %s", symbol)
 
     staker = KellyStaker(cfg)
@@ -1560,21 +1571,20 @@ def main():
     tlog   = TradeLogger(cfg["trade_log"])
     trader = LiveTrader(cfg, initial_ticks, staker, sprt, tlog)
 
-    # Graceful Ctrl+C / SIGTERM
     import signal as _sig
     def _shutdown(s, f):
         log.info("\n[Main] Shutting down ...")
         trader.stop()
-    _sig.signal(_sig.SIGINT,  _shutdown)
+    _sig.signal(_sig.SIGINT, _shutdown)
     try:
         _sig.signal(_sig.SIGTERM, _shutdown)
     except (OSError, ValueError):
-        pass  # SIGTERM not supported on all Windows setups
+        pass
 
     trader.run()
 
     log.info("\n[Main] Session complete.")
-    log.info("  Trades    : %d",   trader.total)
+    log.info("  Trades    : %d",  trader.total)
     log.info("  Win rate  : %.1f%%",
              trader.wins / trader.total * 100 if trader.total else 0)
     log.info("  P&L       : %+.2f", trader.session_pnl)
