@@ -1,6 +1,6 @@
 """
 +=========================================================================+
-|  DERIV RANGE BOT  v10  —  RDBEAR  (Monte Carlo + Jump-Diffusion)       |
+|  DERIV RANGE BOT  v10  —  1HZ10V  (Monte Carlo + Jump-Diffusion)       |
 |                                                                         |
 |  All intelligence is a dual Monte Carlo containment estimator:         |
 |                                                                         |
@@ -66,25 +66,25 @@ CONFIG = {
     "api_token" : os.environ.get("DERIV_API_TOKEN", ""),
 
     # -- Symbol ----------------------------------------------------------------
-    "symbol"    : "1HZ25V",
+    "symbol"    : "1HZ10V",
 
     # -- Tick collection -------------------------------------------------------
-    "collect_hours" : 0.6,          # 30 min history
+    "collect_hours" : 0.5,          # 30 min history (1800 ticks on 1HZ10V)
     "data_dir"      : os.path.join(DATA_DIR, "tick_data"),
-    "min_ticks"     : 500,          # ~90s warmup on RDBEAR (was 500 = ~2.5min)
+    "min_ticks"     : 500,          # ~8 min warmup on 1HZ10V (1 tick/sec)
 
     # -- Expiry choices (minutes) ----------------------------------------------
     "hold_durations" : [2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 15],
 
     # -- Barrier fallback (used until calibration finishes) -------------------
-    "expiryrange_barrier" : 2.97,
+    "expiryrange_barrier" : 50.0,
     "currency"            : "USD",
 
     # -- Monte Carlo -----------------------------------------------------------
     "mc_n_paths"          : 5000,    # raised: std error ≈ ±0.006 (was ±0.014 at 1000 paths)
-    "mc_vol_window"       : 60,      # ticks used to compute EWMA σ
+    "mc_vol_window"       : 120,     # ticks used to compute EWMA σ (2 min on 1HZ10V)
     "mc_ewma_alpha"       : 0.06,    # EWMA decay (RiskMetrics λ=0.94)
-    "mc_ticks_per_min"    : None,    # None = auto-detect from tick timestamps
+    "mc_ticks_per_min"    : 60,         # 1HZ10V = 1 tick/second = 60/min (fixed)
     # p_contain = fraction of paths staying inside barrier.
     # Minimum threshold before considering EV.
     "mc_p_floor"          : 0.670,   # slightly below break-even; ev_thr sanity check protects
@@ -102,7 +102,7 @@ CONFIG = {
     # Jump detection: any log-return whose |r| > jump_threshold * σ_ewma
     # is classified as a jump tick (not pure diffusion).
     "jd_jump_threshold" : 3.0,    # σ-multiples above which a return is a jump
-    "jd_fit_window"     : 300,    # ticks of history used to fit jump params
+    "jd_fit_window"     : 600,    # ticks of history (10 min on 1HZ10V)
     "jd_min_jumps"      : 5,      # minimum observed jumps needed to enable JD paths
     # Blend weight: p_final = (1-w)*p_gbm + w*p_jd
     # 0.0 = pure GBM,  1.0 = pure JD,  0.5 = equal blend
@@ -115,10 +115,10 @@ CONFIG = {
     "ev_check_on_proposal" : True,
 
     # -- Signal persistence (consecutive ticks above p_floor before firing) ---
-    "signal_persistence_ticks" : 2,   # lowered: 3 consecutive passes too rare on RDBEAR
+    "signal_persistence_ticks" : 3,   # 3 consecutive ticks (3 seconds on 1HZ10V)
 
     # -- Post-trade cooldown ---------------------------------------------------
-    "min_ticks_between_trades" : 60,
+    "min_ticks_between_trades" : 120, # 120 ticks = 2 min on 1HZ10V
 
     # -- Kelly staking ---------------------------------------------------------
     "kelly_fraction"  : 0.25,
@@ -1461,18 +1461,24 @@ class LiveTrader:
             return None
 
         # Per-duration barrier search bounds (lo, hi, payout_lo, payout_hi)
+        # 1HZ10V barrier search bounds (lo, hi) in absolute price points.
+        # Price range: ~7000–10000. Per-tick σ ~ 0.002 relative → ~16 abs pts.
+        # Diffusion range over N min (60 ticks/min):
+        #   σ_abs * sqrt(60*N) — e.g. 2 min: 16*sqrt(120) ≈ 175 pts
+        # Bisection targets payout in [46%, 50%].
+        # Bounds are deliberately wide; the bisector narrows within 10 probes.
         dur_bounds = {
-            2 : (0.50,  5.0,  0.46, 0.50),
-            3 : (0.80,  6.0,  0.46, 0.50),
-            4 : (1.00,  7.0,  0.46, 0.50),
-            5 : (1.20,  8.0,  0.46, 0.50),
-            6 : (1.40,  9.0,  0.46, 0.50),
-            7 : (1.60, 10.5,  0.46, 0.50),
-            8 : (1.80, 12.0,  0.46, 0.50),
-            9 : (2.00, 13.5,  0.46, 0.50),
-            10: (2.20, 15.0,  0.46, 0.50),
-            12: (2.60, 17.5,  0.46, 0.50),
-            15: (3.00, 21.0,  0.46, 0.50),
+            2 : ( 30,  300,  0.46, 0.50),
+            3 : ( 50,  400,  0.46, 0.50),
+            4 : ( 70,  500,  0.46, 0.50),
+            5 : ( 90,  600,  0.46, 0.50),
+            6 : (110,  700,  0.46, 0.50),
+            7 : (130,  800,  0.46, 0.50),
+            8 : (150,  900,  0.46, 0.50),
+            9 : (170, 1000,  0.46, 0.50),
+            10: (190, 1100,  0.46, 0.50),
+            12: (230, 1300,  0.46, 0.50),
+            15: (290, 1600,  0.46, 0.50),
         }
         for dur in durations:
             lo, hi, p_lo, p_hi = dur_bounds.get(dur, (0.5, 8.0, 0.46, 0.50))
@@ -1509,7 +1515,7 @@ def main():
     symbol = cfg["symbol"]
 
     log.info("=" * 65)
-    log.info("  DERIV RANGE BOT  v10  —  Monte Carlo + Jump-Diffusion")
+    log.info("  DERIV RANGE BOT  v10  —  1HZ10V  Monte Carlo + Jump-Diffusion")
     log.info("  Symbol   : %s", symbol)
     log.info("  MC paths : %d   vol_window : %d ticks   α=%.2f   terminal_w=%.1f",
              cfg["mc_n_paths"], cfg["mc_vol_window"], cfg["mc_ewma_alpha"],
