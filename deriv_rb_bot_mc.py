@@ -77,7 +77,7 @@ CONFIG = {
     "hold_durations" : [2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 15],
 
     # -- Barrier fallback (used until calibration finishes) -------------------
-    "expiryrange_barrier" : 50.0,
+    "expiryrange_barrier" : 5.3,         # calibrated from live data (5-min mid)
     "currency"            : "USD",
 
     # -- Monte Carlo -----------------------------------------------------------
@@ -87,7 +87,7 @@ CONFIG = {
     "mc_ticks_per_min"    : 60,         # 1HZ10V = 1 tick/second = 60/min (fixed)
     # p_contain = fraction of paths staying inside barrier.
     # Minimum threshold before considering EV.
-    "mc_p_floor"          : 0.670,   # slightly below break-even; ev_thr sanity check protects
+    "mc_p_floor"          : 0.675,   # 1HZ10V: tighter floor — near-normal MC gives honest p values
     # Containment check mode:
     #   terminal (1.0) = final tick only  — matches Deriv EXPIRYRANGE settlement
     #   path     (0.0) = every tick       — strict first-passage check
@@ -103,10 +103,10 @@ CONFIG = {
     # is classified as a jump tick (not pure diffusion).
     "jd_jump_threshold" : 3.0,    # σ-multiples above which a return is a jump
     "jd_fit_window"     : 600,    # ticks of history (10 min on 1HZ10V)
-    "jd_min_jumps"      : 5,      # minimum observed jumps needed to enable JD paths
+    "jd_min_jumps"      : 10,     # 1HZ10V low jump rate; need more evidence before enabling JD
     # Blend weight: p_final = (1-w)*p_gbm + w*p_jd
     # 0.0 = pure GBM,  1.0 = pure JD,  0.5 = equal blend
-    "jd_weight"         : 0.5,
+    "jd_weight"         : 0.2,    # 1HZ10V near-normal (kurt=+0.14); GBM dominates
 
     # -- EV gate ---------------------------------------------------------------
     "ev_confidence_floor"  : 0.673,  # 1/1.486 — calibrated to actual 48.6% payout
@@ -1461,24 +1461,22 @@ class LiveTrader:
             return None
 
         # Per-duration barrier search bounds (lo, hi, payout_lo, payout_hi)
-        # 1HZ10V barrier search bounds (lo, hi) in absolute price points.
-        # Price range: ~7000–10000. Per-tick σ ~ 0.002 relative → ~16 abs pts.
-        # Diffusion range over N min (60 ticks/min):
-        #   σ_abs * sqrt(60*N) — e.g. 2 min: 16*sqrt(120) ≈ 175 pts
-        # Bisection targets payout in [46%, 50%].
-        # Bounds are deliberately wide; the bisector narrows within 10 probes.
+        # 1HZ10V barrier search bounds — derived from live capture 2026-06-13.
+        # Price ~10070, σ_ewma_abs=0.153 pts/tick, tpm=60, near-normal returns.
+        # 1σ diffusion range = 0.153 * sqrt(tpm * dur_mins).
+        # Bounds: lo=1.2×1σ, hi=4×1σ (wide enough for calibrator bisection).
         dur_bounds = {
-            2 : ( 30,  300,  0.46, 0.50),
-            3 : ( 50,  400,  0.46, 0.50),
-            4 : ( 70,  500,  0.46, 0.50),
-            5 : ( 90,  600,  0.46, 0.50),
-            6 : (110,  700,  0.46, 0.50),
-            7 : (130,  800,  0.46, 0.50),
-            8 : (150,  900,  0.46, 0.50),
-            9 : (170, 1000,  0.46, 0.50),
-            10: (190, 1100,  0.46, 0.50),
-            12: (230, 1300,  0.46, 0.50),
-            15: (290, 1600,  0.46, 0.50),
+            2 : ( 2.0,  6.7,  0.46, 0.50),
+            3 : ( 2.5,  8.2,  0.46, 0.50),
+            4 : ( 2.8,  9.5,  0.46, 0.50),
+            5 : ( 3.2, 10.6,  0.46, 0.50),
+            6 : ( 3.5, 11.6,  0.46, 0.50),
+            7 : ( 3.8, 12.5,  0.46, 0.50),
+            8 : ( 4.0, 13.4,  0.46, 0.50),
+            9 : ( 4.3, 14.2,  0.46, 0.50),
+            10: ( 4.5, 15.0,  0.46, 0.50),
+            12: ( 4.9, 16.4,  0.46, 0.50),
+            15: ( 5.5, 18.3,  0.46, 0.50),
         }
         for dur in durations:
             lo, hi, p_lo, p_hi = dur_bounds.get(dur, (0.5, 8.0, 0.46, 0.50))
